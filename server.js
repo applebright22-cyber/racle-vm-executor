@@ -7,17 +7,19 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
 const SNAPSHOT_PATH = process.env.SNAPSHOT_PATH || "./admin.snapshot";
 const WASM_PATH = process.env.WASM_PATH || "./node_modules/v86/build/v86.wasm";
-const BIOS_PATH = process.env.BIOS_PATH || "./node_modules/v86/bios/seabios.bin";
-const VGA_BIOS_PATH = process.env.VGA_BIOS_PATH || "./node_modules/v86/bios/vgabios.bin";
+const BIOS_PATH = process.env.BIOS_PATH || "./bios/seabios.bin";
+const VGA_BIOS_PATH = process.env.VGA_BIOS_PATH || "./bios/vgabios.bin";
+const CDROM_PATH = process.env.CDROM_PATH || "./boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso";
 const EXECUTOR_TOKEN = process.env.ORACLE_EXECUTOR_TOKEN || "";
+const MEMORY_SIZE = 128 * 1024 * 1024;
+const VGA_MEMORY_SIZE = 8 * 1024 * 1024;
 const MAX_COMMAND_LENGTH = 4096;
 const DEFAULT_TIMEOUT_MS = 15000;
 
 let emulator;
 let bootState = "starting";
 let bootError = null;
-let serialBuffer = "";
-const pending = new Map();
+let busy = false;
 
 function sendJson(res, status, value) {
   const body = JSON.stringify(value);
@@ -31,8 +33,8 @@ function sendJson(res, status, value) {
 
 function authorized(req) {
   const supplied = req.headers["x-executor-token"];
-  if (!EXECUTOR_TOKEN || typeof supplied !== "string") return false;
-  return supplied.length === EXECUTOR_TOKEN.length && supplied === EXECUTOR_TOKEN;
+  return Boolean(EXECUTOR_TOKEN && typeof supplied === "string" &&
+    supplied.length === EXECUTOR_TOKEN.length && supplied === EXECUTOR_TOKEN);
 }
 
 function readJson(req) {
@@ -54,54 +56,187 @@ function readJson(req) {
   });
 }
 
-function onSerialByte(byte) {
-  serialBuffer = (serialBuffer + String.fromCharCode(byte & 255)).slice(-128 * 1024);
-  for (const [id, job] of pending) {
-    if (!serialBuffer.includes(job.marker)) continue;
-    const markerIndex = serialBuffer.lastIndexOf(job.marker);
-    const startIndex = serialBuffer.lastIndexOf(job.startMarker, markerIndex);
-    if (startIndex < 0) continue;
-    const output = serialBuffer.slice(startIndex + job.startMarker.length, markerIndex);
-    clearTimeout(job.timer);
-    pending.delete(id);
-    job.resolve({ stdout: output.replace(/\r/g, "").trim(), stderr: "", exit_code: 0, execution_id: id });
-    serialBuffer = serialBuffer.slice(markerIndex + job.marker.length);
+function arrayBuffer(buffer) {
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+}
+
+function parseSnapshotHeader(buffer, label) {
+  if (buffer.byteLength < 16) throw new Error(label + "_too_small");
+  const view = new DataView(buffer);
+  const magic = view.getInt32(0, true);
+  const version = view.getInt32(4, true);
+  const metadataLength = view.getInt32(12, true);
+  if (magic !== -2039052682) throw new Error(label + "_invalid_v86_magic");
+  if (version !== 6) throw new Error(label + "_unsupported_v86_state_version_" + version);
+  if (metadataLength < 2 || metadataLength > buffer.byteLength - 16) {
+    throw new Error(label + "_invalid_metadata_length");
   }
+  const metadata = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 16, metadataLength)));
+  if (!Array.isArray(metadata.buffer_infos)) throw new Error(label + "_missing_buffer_infos");
+  return { version, metadata };
+}
+
+function checkSnapshotCompatibility(snapshotBuffer, freshBuffer) {
+  const saved = parseSnapshotHeader(snapshotBuffer, "snapshot");
+  const fresh = parseSnapshotHeader(freshBuffer, "fresh_state");
+  const expected = saved.metadata.buffer_infos;
+  const actual = fresh.metadata.buffer_infos;
+  const differences = [];
+  for (let i = 0; i < Math.max(expected.length, actual.length); i++) {
+    const a = expected[i]?.length;
+    const b = actual[i]?.length;
+    if (a !== b) differences.push({ index: i, snapshot: a ?? null, runtime: b ?? null });
+  }
+  if (differences.length) {
+    const first = differences.slice(0, 8).map(x =>
+      x.index + ":" + (x.snapshot ?? "missing") + "/" + (x.runtime ?? "missing")
+    ).join(", ");
+    throw new Error("snapshot_machine_config_mismatch: snapshot_buffers=" + expected.length +
+      ", runtime_buffers=" + actual.length + ", first_differences=" + first +
+      ". Required configuration: 128MiB RAM, 8MiB VGA RAM, TinyCore CD-ROM, NE2K network device.");
+  }
+}
+
+function screenText() {
+  try {
+    const rows = emulator?.screen_adapter?.get_text_screen?.();
+    return Array.isArray(rows) ? rows.join("\n") : "";
+  } catch {
+    return "";
+  }
+}
+
+async function sendGuestText(text) {
+  if (!emulator || typeof emulator.keyboard_send_text !== "function") {
+    throw new Error("v86_keyboard_input_unavailable");
+  }
+  await emulator.keyboard_send_text(text);
+}
+
+async function waitForScreen(predicate, timeoutMs, errorCode) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const text = screenText();
+    if (predicate(text)) return text;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error(errorCode + (screenText() ? ": " + screenText().slice(-500) : ""));
 }
 
 async function startVm() {
   try {
-    const state = await fs.readFile(SNAPSHOT_PATH);
-    const wasm = await fs.readFile(WASM_PATH);
-    const bios = await fs.readFile(BIOS_PATH);
-    const vgaBios = await fs.readFile(VGA_BIOS_PATH);
+    const [snapshotFile, wasmFile, biosFile, vgaBiosFile, cdromFile] = await Promise.all([
+      fs.readFile(SNAPSHOT_PATH),
+      fs.readFile(WASM_PATH),
+      fs.readFile(BIOS_PATH),
+      fs.readFile(VGA_BIOS_PATH),
+      fs.readFile(CDROM_PATH)
+    ]);
+    const snapshot = arrayBuffer(snapshotFile);
+    const wasm = arrayBuffer(wasmFile);
+    const bios = arrayBuffer(biosFile);
+    const vgaBios = arrayBuffer(vgaBiosFile);
+    const cdrom = arrayBuffer(cdromFile);
+    parseSnapshotHeader(snapshot, "snapshot");
+
+    const vmIp = process.env.VM_IP || "10.240.0.2";
+    const routerIp = process.env.ROUTER_IP || "10.240.0.1";
+    const relayUrl = process.env.NETWORK_RELAY_URL ||
+      "ws://127.0.0.1:8788/api/network/wisp/?identity=admin&ticket=offline";
+
     emulator = new V86({
       wasm_path: WASM_PATH,
       wasm: { buffer: wasm },
       bios: { buffer: bios },
       vga_bios: { buffer: vgaBios },
-      autostart: false
+      cdrom: { buffer: cdrom },
+      memory_size: MEMORY_SIZE,
+      vga_memory_size: VGA_MEMORY_SIZE,
+      net_device: {
+        type: "ne2k",
+        relay_url: relayUrl,
+        router_ip: routerIp,
+        vm_ip: vmIp,
+        masquerade: true,
+        dns_method: "doh",
+        doh_server: "cloudflare-dns.com",
+        preserve_mac_from_state_image: false
+      },
+      autostart: false,
+      disable_keyboard: false,
+      disable_mouse: true
     });
+
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("v86_init_timeout")), 30000);
-      emulator.add_listener("emulator-ready", () => {
-        clearTimeout(timer);
-        resolve();
-      });
+      const done = () => { clearTimeout(timer); resolve(); };
+      emulator.add_listener("emulator-loaded", done);
+      emulator.add_listener("emulator-ready", done);
       emulator.add_listener("download-error", e => {
         clearTimeout(timer);
         reject(new Error("v86_asset_load_failed:" + String(e)));
       });
     });
-    const stateBuffer = state.buffer.slice(state.byteOffset, state.byteOffset + state.byteLength);
-    await emulator.restore_state(stateBuffer);
-    emulator.add_listener("serial0-output-byte", onSerialByte);
+
+    // Reject incompatible state before restore/run. This catches missing devices and
+    // memory-size differences before they become a CPU page-walk stack overflow.
+    const freshState = arrayBuffer(Buffer.from(await emulator.save_state()));
+    checkSnapshotCompatibility(snapshot, freshState);
+
+    console.log("Snapshot compatibility passed; restoring the existing Admin snapshot.");
+    await emulator.restore_state(snapshot);
     await emulator.run();
+
+    // This guest is a VGA/keyboard shell, not a serial-console shell. Verify actual
+    // keyboard-to-shell execution before reporting ready to the Cloudflare Worker.
+    await waitForScreen(text => /tc@box:~\$|tc@box:~#/.test(text), 30000, "guest_shell_prompt_not_found");
+    const marker = "__ORACLE_EXECUTOR_READY_" + randomUUID().replaceAll("-", "") + "__";
+    await sendGuestText("echo " + marker + "\n");
+    await waitForScreen(text => text.includes(marker), 10000, "guest_shell_handshake_failed");
     bootState = "ready";
+    console.log("VM ready: snapshot restored and interactive TinyCore shell verified.");
   } catch (error) {
     bootState = "error";
     bootError = error instanceof Error ? error.message : String(error);
     console.error("VM start failed:", bootError);
+    try { emulator?.stop(); } catch {}
+  }
+}
+
+async function executeCommand(command, timeoutMs) {
+  if (busy) return { status: 429, body: { error: "executor_busy", retry_after_ms: 250 } };
+  busy = true;
+  const id = randomUUID().replaceAll("-", "");
+  const startMarker = "__ORACLE_EXEC_START_" + id + "__";
+  const endMarker = "__ORACLE_EXEC_END_" + id + "__:";
+  const shell = "printf '\\n" + startMarker + "\\n'; ( " + command +
+    " ); rc=$?; printf '\\n" + endMarker + "%s\\n' \"$rc\"";
+  const deadline = Date.now() + timeoutMs;
+  try {
+    await sendGuestText(shell + "\n");
+    while (Date.now() < deadline) {
+      const text = screenText();
+      const endAt = text.lastIndexOf(endMarker);
+      if (endAt >= 0) {
+        const after = text.slice(endAt + endMarker.length);
+        const match = /^(-?\d+)/.exec(after.trimStart());
+        if (match) {
+          const startAt = text.lastIndexOf(startMarker, endAt);
+          const stdout = startAt >= 0
+            ? text.slice(startAt + startMarker.length, endAt).replace(/^\s*\n?/, "").replace(/\n?\s*$/, "")
+            : "";
+          return { status: 200, body: {
+            runtime: "oracle-v86", browser_required: false, execution_id: id,
+            stdout, stderr: "", exit_code: Number(match[1]),
+            output_note: "Output is limited to text still visible in the guest terminal."
+          } };
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 75));
+    }
+    return { status: 504, body: { error: "execution_timeout", execution_id: id, timed_out: true } };
+  } finally {
+    busy = false;
   }
 }
 
@@ -143,28 +278,10 @@ const server = http.createServer(async (req, res) => {
     if (typeof body.command !== "string" || !body.command.trim() || body.command.length > MAX_COMMAND_LENGTH) {
       return sendJson(res, 400, { error: "command_must_be_1_to_4096_characters" });
     }
-    if (pending.size > 0) return sendJson(res, 429, { error: "executor_busy", retry_after_ms: 250 });
-
-    const id = randomUUID();
-    const startMarker = "__EXEC_START_" + id + "__";
-    const marker = "__EXEC_END_" + id + "__";
-    const requestedTimeout = Number(body.timeout_ms) || DEFAULT_TIMEOUT_MS;
-    const timeout = Math.max(1000, Math.min(requestedTimeout, 20000));
-    const promise = new Promise(resolve => {
-      const timer = setTimeout(() => {
-        pending.delete(id);
-        resolve({ error: "execution_timeout", execution_id: id, timed_out: true });
-      }, timeout);
-      pending.set(id, { startMarker, marker, timer, resolve });
-    });
-
-    // Initial milestone uses the existing Admin baseline snapshot. Per-account
-    // snapshot selection is intentionally not claimed until that mapping is wired.
-    emulator.serial0_send("echo " + startMarker + "\n" + body.command + "\necho " + marker + "\n");
-    const result = await promise;
-    return sendJson(res, result.error ? 504 : 200, {
-      vm_id: identity, runtime: "oracle-v86", browser_required: false, ...result
-    });
+    const requested = Number(body.timeout_ms) || DEFAULT_TIMEOUT_MS;
+    const timeout = Math.max(1000, Math.min(requested, 20000));
+    const result = await executeCommand(body.command, timeout);
+    return sendJson(res, result.status, { vm_id: identity, ...result.body });
   }
 
   return sendJson(res, 404, { error: "not_found" });
