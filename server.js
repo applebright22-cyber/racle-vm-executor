@@ -321,7 +321,8 @@ async function runOracleBridgePoller() {
             const timeout = Math.max(1000, Math.min(requested, MAX_TIMEOUT_MS));
             const execution = await executeCommand(job.identity, payload.command, timeout);
             status = execution.status;
-            result = execution.body;
+            // Preserve the public Worker API response shape used by the previous executor.
+            result = { vm_id: job.identity, ...execution.body };
           }
         }
       } catch (error) {
