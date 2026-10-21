@@ -24,18 +24,15 @@ git pull --ff-only
 bash setup-oracle.sh
 ```
 
-The setup script installs the dependency-free Node.js service, creates the persistent session directory, and configures systemd. It reuses the existing `ORACLE_EXECUTOR_TOKEN` from `/etc/oracle-vm-executor.env` so the current Cloudflare Worker secret remains valid. It only creates and prints a token on a first install when no token exists.
+The setup script installs the dependency-free Node.js service, creates the persistent session directory, configures systemd, and then registers the Oracle endpoint and machine-to-machine token with the existing Worker. It reuses the existing `ORACLE_EXECUTOR_TOKEN` from `/etc/oracle-vm-executor.env` or creates one on first install. It never prints the token.
 
-It does not download or replace `admin.snapshot`, and it does not require the five-digit Admin code.
+During setup, enter the Worker URL, the Oracle public IPv4 address if it is not auto-detected, and the existing five-digit Admin access code. The code is used only to authorize one-time bridge registration; it is not saved on Oracle. The token is stored in the Worker’s dedicated Durable Object record, so no Cloudflare API token or manual `wrangler secret put` step is needed for the bridge.
 
-## Existing Cloudflare configuration
+**Deploy the small Worker source update once before running this installer version.** The update adds `POST /api/oracle/register`, `GET /api/oracle/health`, and login-session authentication for the existing VM API. This is not a rebuild of the Cloudflare project. Once the updated Worker is deployed, future Oracle installations register themselves automatically.
 
-Keep the current Worker deployment and routes. Ensure its existing secrets/config point to this Oracle endpoint:
+The setup script finishes only after the Worker reports that it can reach Oracle. If the health check fails, check that inbound TCP/8787 is allowed in the Oracle Cloud network security list and host firewall.
 
-- `ORACLE_EXECUTOR_URL`: `http://<oracle-host-public-ip>:8787`
-- `ORACLE_EXECUTOR_TOKEN`: the existing token already configured in Oracle's root-owned environment file and in the Worker secret.
-
-Allow inbound TCP/8787 in the Oracle Cloud network security list/security list and host firewall, if your current deployment uses direct inbound HTTP. If the existing Worker connects through another already-configured path, keep using that path.
+It does not download or replace `admin.snapshot`, and it does not require the five-digit Admin code for normal executor operation.
 
 ## API
 
