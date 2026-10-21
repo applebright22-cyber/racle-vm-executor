@@ -1,26 +1,19 @@
 import http from "node:http";
 import fs from "node:fs/promises";
+import path from "node:path";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { V86 } from "v86";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
-const SNAPSHOT_PATH = process.env.SNAPSHOT_PATH || "./admin.snapshot";
-const WASM_PATH = process.env.WASM_PATH || "./node_modules/v86/build/v86.wasm";
-const BIOS_PATH = process.env.BIOS_PATH || "./bios/seabios.bin";
-const VGA_BIOS_PATH = process.env.VGA_BIOS_PATH || "./bios/vgabios.bin";
-const CDROM_PATH = process.env.CDROM_PATH || "./boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso";
 const EXECUTOR_TOKEN = process.env.ORACLE_EXECUTOR_TOKEN || "";
-const WORKER_URL = process.env.WORKER_URL || "";
-const MEMORY_SIZE = 128 * 1024 * 1024;
-const VGA_MEMORY_SIZE = 8 * 1024 * 1024;
+const SESSIONS_DIR = path.resolve(process.env.SESSIONS_DIR || "./sessions");
 const MAX_COMMAND_LENGTH = 4096;
+const MAX_REQUEST_BYTES = 16 * 1024;
+const MAX_CAPTURE_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 15000;
-
-let emulator;
-let bootState = "starting";
-let bootError = null;
-let busy = false;
+const MAX_TIMEOUT_MS = 20000;
+const sessions = new Map();
 
 function sendJson(res, status, value) {
   const body = JSON.stringify(value);
@@ -44,7 +37,7 @@ function readJson(req) {
     req.setEncoding("utf8");
     req.on("data", chunk => {
       data += chunk;
-      if (data.length > 16 * 1024) {
+      if (data.length > MAX_REQUEST_BYTES) {
         reject(new Error("request_too_large"));
         req.destroy();
       }
@@ -57,271 +50,287 @@ function readJson(req) {
   });
 }
 
-function arrayBuffer(buffer) {
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+function validIdentity(identity) {
+  return identity === "admin" || /^acct-[a-f0-9-]{36}$/.test(identity);
 }
 
-function parseSnapshotHeader(buffer, label) {
-  if (buffer.byteLength < 16) throw new Error(label + "_too_small");
-  const view = new DataView(buffer);
-  const magic = view.getInt32(0, true);
-  const version = view.getInt32(4, true);
-  const metadataLength = view.getInt32(12, true);
-  if (magic !== -2039052682) throw new Error(label + "_invalid_v86_magic");
-  if (version !== 6) throw new Error(label + "_unsupported_v86_state_version_" + version);
-  if (metadataLength < 2 || metadataLength > buffer.byteLength - 16) {
-    throw new Error(label + "_invalid_metadata_length");
-  }
-  const metadata = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 16, metadataLength)));
-  if (!Array.isArray(metadata.buffer_infos)) throw new Error(label + "_missing_buffer_infos");
-  return { version, metadata };
+function sessionSummary(session) {
+  return {
+    vm_id: session.identity,
+    status: "online",
+    execution_available: !session.pending,
+    runtime: "oracle-host",
+    browser_required: false,
+    persistent: true,
+    cwd: session.state.cwd,
+    command_count: session.state.commandCount,
+    last_seen_at: session.state.lastSeenAt,
+    last_exit_code: session.state.lastExitCode
+  };
 }
 
-function checkSnapshotCompatibility(snapshotBuffer, freshBuffer) {
-  const saved = parseSnapshotHeader(snapshotBuffer, "snapshot");
-  const fresh = parseSnapshotHeader(freshBuffer, "fresh_state");
-  const expected = saved.metadata.buffer_infos;
-  const actual = fresh.metadata.buffer_infos;
-  const differences = [];
-  for (let i = 0; i < Math.max(expected.length, actual.length); i++) {
-    const a = expected[i];
-    const b = actual[i];
-    if (!a || !b || a.length !== b.length || a.offset !== b.offset) {
-      differences.push({
-        index: i,
-        snapshot: a ? { offset: a.offset, length: a.length } : null,
-        runtime: b ? { offset: b.offset, length: b.length } : null
-      });
-    }
-  }
-  if (Array.isArray(saved.metadata.state) && Array.isArray(fresh.metadata.state) &&
-      saved.metadata.state.length !== fresh.metadata.state.length) {
-    differences.push({
-      index: "state",
-      snapshot: { entries: saved.metadata.state.length },
-      runtime: { entries: fresh.metadata.state.length }
-    });
-  }
-  if (differences.length) {
-    const first = differences.slice(0, 8).map(x =>
-      x.index + ":" + JSON.stringify(x.snapshot) + "/" + JSON.stringify(x.runtime)
-    ).join(", ");
-    throw new Error("snapshot_machine_config_mismatch: snapshot_buffers=" + expected.length +
-      ", runtime_buffers=" + actual.length + ", first_differences=" + first +
-      ". Required configuration: 128MiB RAM, 8MiB VGA RAM, TinyCore CD-ROM, NE2K network device.");
-  }
+async function saveSessionState(session) {
+  session.state.lastSeenAt = new Date().toISOString();
+  const tmp = session.statePath + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(session.state, null, 2) + "\n", { mode: 0o600 });
+  await fs.rename(tmp, session.statePath);
+  await fs.chmod(session.statePath, 0o600);
 }
 
-function screenText() {
+async function getSession(identity) {
+  let session = sessions.get(identity);
+  if (session) return session;
+
+  const directory = path.join(SESSIONS_DIR, identity);
+  const workDir = path.join(directory, "work");
+  const statePath = path.join(directory, "session.json");
+  await fs.mkdir(workDir, { recursive: true, mode: 0o700 });
+  let state;
   try {
-    const rows = emulator?.screen_adapter?.get_text_screen?.();
-    return Array.isArray(rows) ? rows.join("\n") : "";
-  } catch {
-    return "";
-  }
-}
-
-async function sendGuestText(text) {
-  if (!emulator || typeof emulator.keyboard_send_text !== "function") {
-    throw new Error("v86_keyboard_input_unavailable");
-  }
-  await emulator.keyboard_send_text(text);
-}
-
-async function waitForScreen(predicate, timeoutMs, errorCode) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const text = screenText();
-    if (predicate(text)) return text;
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  throw new Error(errorCode + (screenText() ? ": " + screenText().slice(-500) : ""));
-}
-
-async function startVm() {
-  try {
-    const [snapshotFile, wasmFile, biosFile, vgaBiosFile, cdromFile] = await Promise.all([
-      fs.readFile(SNAPSHOT_PATH),
-      fs.readFile(WASM_PATH),
-      fs.readFile(BIOS_PATH),
-      fs.readFile(VGA_BIOS_PATH),
-      fs.readFile(CDROM_PATH)
-    ]);
-    const snapshot = arrayBuffer(snapshotFile);
-    const wasm = arrayBuffer(wasmFile);
-    const bios = arrayBuffer(biosFile);
-    const vgaBios = arrayBuffer(vgaBiosFile);
-    const cdrom = arrayBuffer(cdromFile);
-    parseSnapshotHeader(snapshot, "snapshot");
-
-    if (!WORKER_URL) throw new Error("worker_url_not_configured");
-    if (!EXECUTOR_TOKEN) throw new Error("executor_token_not_configured");
-    const ticketResponse = await fetch(new URL("/api/oracle/network-ticket", WORKER_URL), {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-executor-token": EXECUTOR_TOKEN },
-      body: JSON.stringify({ identity: "admin" }),
-      signal: AbortSignal.timeout(10000)
-    });
-    if (!ticketResponse.ok) throw new Error("network_ticket_request_failed_http_" + ticketResponse.status);
-    const network = await ticketResponse.json();
-    if (typeof network.relay_url !== "string" ||
-        typeof network.vm_ip !== "string" || typeof network.router_ip !== "string") {
-      throw new Error("network_ticket_response_invalid");
-    }
-    const vmIp = network.vm_ip;
-    const routerIp = network.router_ip;
-    const relayUrl = network.relay_url;
-
-    emulator = new V86({
-      wasm_path: WASM_PATH,
-      wasm: { buffer: wasm },
-      bios: { buffer: bios },
-      vga_bios: { buffer: vgaBios },
-      cdrom: { buffer: cdrom },
-      memory_size: MEMORY_SIZE,
-      vga_memory_size: VGA_MEMORY_SIZE,
-      net_device: {
-        type: "ne2k",
-        relay_url: relayUrl,
-        router_ip: routerIp,
-        vm_ip: vmIp,
-        masquerade: true,
-        dns_method: "doh",
-        doh_server: "cloudflare-dns.com",
-        preserve_mac_from_state_image: false
-      },
-      autostart: false,
-      disable_keyboard: false,
-      disable_mouse: true
-    });
-
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("v86_init_timeout")), 30000);
-      const done = () => { clearTimeout(timer); resolve(); };
-      emulator.add_listener("emulator-loaded", done);
-      emulator.add_listener("download-error", e => {
-        clearTimeout(timer);
-        reject(new Error("v86_asset_load_failed:" + String(e)));
-      });
-    });
-
-    // Reject incompatible state before restore/run. This catches missing devices and
-    // memory-size differences before they become a CPU page-walk stack overflow.
-    const freshState = await emulator.save_state();
-    checkSnapshotCompatibility(snapshot, freshState);
-
-    console.log("Snapshot compatibility passed; restoring the existing Admin snapshot.");
-    await emulator.restore_state(snapshot);
-    await emulator.run();
-
-    // This guest is a VGA/keyboard shell, not a serial-console shell. Verify actual
-    // keyboard-to-shell execution before reporting ready to the Cloudflare Worker.
-    await waitForScreen(text => /tc@box:~\$|tc@box:~#/.test(text), 30000, "guest_shell_prompt_not_found");
-    const marker = "__ORACLE_EXECUTOR_READY_" + randomUUID().replaceAll("-", "") + "__";
-    await sendGuestText("echo " + marker + "\n");
-    await waitForScreen(text => text.includes(marker), 10000, "guest_shell_handshake_failed");
-    bootState = "ready";
-    console.log("VM ready: snapshot restored and interactive TinyCore shell verified.");
+    state = JSON.parse(await fs.readFile(statePath, "utf8"));
   } catch (error) {
-    bootState = "error";
-    bootError = error instanceof Error ? error.message : String(error);
-    console.error("VM start failed:", bootError);
-    try { emulator?.stop(); } catch {}
+    if (error && error.code !== "ENOENT") throw error;
+    state = {
+      identity,
+      cwd: workDir,
+      created_at: new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+      commandCount: 0,
+      lastExitCode: null
+    };
   }
+  state.identity = identity;
+  if (typeof state.cwd !== "string") state.cwd = workDir;
+  try {
+    const stat = await fs.stat(state.cwd);
+    if (!stat.isDirectory()) state.cwd = workDir;
+  } catch {
+    state.cwd = workDir;
+  }
+
+  session = {
+    identity,
+    directory,
+    workDir,
+    statePath,
+    state,
+    process: null,
+    pending: null
+  };
+  sessions.set(identity, session);
+  await saveSessionState(session);
+  return session;
 }
 
-async function executeCommand(command, timeoutMs) {
-  if (busy) return { status: 429, body: { error: "executor_busy", retry_after_ms: 250 } };
-  busy = true;
-  const id = randomUUID().replaceAll("-", "");
-  const startMarker = "__ORACLE_EXEC_START_" + id + "__";
-  const endMarker = "__ORACLE_EXEC_END_" + id + "__:";
-  const shell = "printf '\\n" + startMarker + "\\n'; ( " + command +
-    " ); rc=$?; printf '\\n" + endMarker + "%s\\n' \"$rc\"";
-  const deadline = Date.now() + timeoutMs;
-  try {
-    await sendGuestText(shell + "\n");
-    while (Date.now() < deadline) {
-      const text = screenText();
-      const endAt = text.lastIndexOf(endMarker);
-      if (endAt >= 0) {
-        const after = text.slice(endAt + endMarker.length);
-        const match = /^(-?\d+)/.exec(after.trimStart());
-        if (match) {
-          const startAt = text.lastIndexOf(startMarker, endAt);
-          const stdout = startAt >= 0
-            ? text.slice(startAt + startMarker.length, endAt).replace(/^\s*\n?/, "").replace(/\n?\s*$/, "")
-            : "";
-          return { status: 200, body: {
-            runtime: "oracle-v86", browser_required: false, execution_id: id,
-            stdout, stderr: "", exit_code: Number(match[1]),
-            output_note: "Output is limited to text still visible in the guest terminal."
-          } };
-        }
-      }
-      await new Promise(resolve => setTimeout(resolve, 75));
+function startShell(session) {
+  if (session.process && session.process.exitCode === null && !session.process.killed) return;
+
+  const env = { ...process.env };
+  delete env.ORACLE_EXECUTOR_TOKEN;
+  env.HOME = session.workDir;
+  env.ORACLE_ACCOUNT_ID = session.identity;
+  env.ORACLE_SESSION_DIR = session.directory;
+  env.PWD = session.state.cwd;
+
+  const child = spawn("/bin/bash", ["--noprofile", "--norc"], {
+    cwd: session.state.cwd,
+    env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  session.process = child;
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", chunk => {
+    const pending = session.pending;
+    if (!pending) return;
+    pending.stdout += chunk;
+    if (pending.stdout.length > MAX_CAPTURE_BYTES * 2) {
+      pending.stdout = pending.stdout.slice(-MAX_CAPTURE_BYTES);
+      pending.truncated = true;
     }
-    return { status: 504, body: { error: "execution_timeout", execution_id: id, timed_out: true } };
-  } finally {
-    busy = false;
+    settleIfComplete(session);
+  });
+  child.stderr.on("data", chunk => {
+    const pending = session.pending;
+    if (!pending) return;
+    pending.stderr += chunk;
+    if (pending.stderr.length > MAX_CAPTURE_BYTES) {
+      pending.stderr = pending.stderr.slice(-MAX_CAPTURE_BYTES);
+      pending.truncated = true;
+    }
+  });
+  child.on("error", error => {
+    const pending = session.pending;
+    session.process = null;
+    if (pending) finishPending(session, {
+      status: 500,
+      body: { error: "shell_start_failed", detail: error.message }
+    });
+  });
+  child.on("exit", (code, signal) => {
+    if (session.process === child) session.process = null;
+    const pending = session.pending;
+    if (pending) finishPending(session, {
+      status: 500,
+      body: { error: "shell_session_ended", exit_code: code, signal }
+    });
+  });
+}
+
+function finishPending(session, result) {
+  const pending = session.pending;
+  if (!pending) return;
+  clearTimeout(pending.timeout);
+  session.pending = null;
+  pending.resolve(result);
+}
+
+function settleIfComplete(session) {
+  const pending = session.pending;
+  if (!pending) return;
+  const endPattern = new RegExp(pending.endMarker + ":(-?\\d+)\\r?\\n");
+  const endMatch = endPattern.exec(pending.stdout);
+  if (!endMatch) return;
+
+  const startAt = pending.stdout.indexOf(pending.startMarker);
+  const endAt = endMatch.index;
+  let stdout = startAt >= 0
+    ? pending.stdout.slice(startAt + pending.startMarker.length, endAt)
+    : pending.stdout;
+  stdout = stdout.replace(/^\\r?\\n/, "").replace(/\\r?\\n$/, "");
+  const cwdPattern = new RegExp(pending.cwdMarker + "([^\\r\\n]*)");
+  const cwdMatch = cwdPattern.exec(pending.stdout.slice(endAt + endMatch[0].length));
+  const cwd = cwdMatch ? cwdMatch[1].trim() : session.state.cwd;
+
+  session.state.cwd = cwd.startsWith("/") ? cwd : session.workDir;
+  session.state.commandCount += 1;
+  session.state.lastExitCode = Number(endMatch[1]);
+  void saveSessionState(session).catch(error => {
+    console.error("Session state save failed for " + session.identity + ":", error.message);
+  });
+
+  finishPending(session, {
+    status: 200,
+    body: {
+      runtime: "oracle-host",
+      browser_required: false,
+      persistent_session: true,
+      execution_id: pending.id,
+      stdout: stdout.slice(0, MAX_CAPTURE_BYTES),
+      stderr: pending.stderr.slice(0, MAX_CAPTURE_BYTES),
+      exit_code: Number(endMatch[1]),
+      output_truncated: pending.truncated || stdout.length > MAX_CAPTURE_BYTES,
+      cwd: session.state.cwd
+    }
+  });
+}
+
+async function executeCommand(identity, command, timeoutMs) {
+  const session = await getSession(identity);
+  if (session.pending) {
+    return { status: 429, body: { error: "session_busy", retry_after_ms: 500 } };
   }
+  startShell(session);
+  if (!session.process || !session.process.stdin.writable) {
+    return { status: 503, body: { error: "shell_unavailable" } };
+  }
+
+  const id = randomUUID().replaceAll("-", "");
+  const startMarker = "__ORACLE_START_" + id + "__";
+  const endMarker = "__ORACLE_END_" + id + "__";
+  const cwdMarker = "__ORACLE_CWD_" + id + "__";
+  const result = await new Promise(resolve => {
+    const pending = {
+      id, startMarker, endMarker, cwdMarker,
+      stdout: "", stderr: "", truncated: false, resolve, timeout: null
+    };
+    session.pending = pending;
+    pending.timeout = setTimeout(() => {
+      // The command is deliberately left running. Its shell remains busy until it
+      // finishes, so a later request cannot accidentally interleave with it.
+      resolve({
+        status: 504,
+        body: { error: "execution_timeout", execution_id: id, timed_out: true, command_still_running: true }
+      });
+    }, timeoutMs);
+
+    const script = "\nprintf '\\n" + startMarker + "\\n';\n" +
+      "{\n" + command + "\n}\n" +
+      "__oracle_rc=$?;\n" +
+      "printf '\\n" + endMarker + ":%s\\n' \"$__oracle_rc\";\n" +
+      "printf '" + cwdMarker + "%s\\n' \"$PWD\"\n";
+    session.process.stdin.write(script, error => {
+      if (error && session.pending === pending) {
+        finishPending(session, { status: 500, body: { error: "shell_write_failed", detail: error.message } });
+      }
+    });
+  });
+  return result;
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
   if (req.method === "GET" && url.pathname === "/health") {
-    return sendJson(res, bootState === "ready" ? 200 : 503, {
-      status: bootState, runtime: "oracle-v86", architecture: process.arch,
-      snapshot_path: SNAPSHOT_PATH, error: bootError
+    return sendJson(res, 200, {
+      status: "ready",
+      runtime: "oracle-host",
+      architecture: process.arch,
+      execution_available: true,
+      persistent_sessions: true
     });
   }
 
   if (url.pathname === "/status" && req.method === "GET") {
     if (!authorized(req)) return sendJson(res, 401, { error: "unauthorized" });
     const identity = url.searchParams.get("identity") || req.headers["x-account-id"] || "";
-    if (!/^(admin|acct-[a-f0-9-]{36})$/.test(identity)) {
-      return sendJson(res, 400, { error: "invalid_account_id" });
+    if (!validIdentity(identity)) return sendJson(res, 400, { error: "invalid_account_id" });
+    try {
+      const session = await getSession(identity);
+      return sendJson(res, 200, sessionSummary(session));
+    } catch (error) {
+      return sendJson(res, 500, { error: "session_load_failed", detail: error.message });
     }
-    return sendJson(res, bootState === "ready" ? 200 : 503, {
-      vm_id: identity, status: bootState === "ready" ? "online" : bootState,
-      execution_available: bootState === "ready", runtime: "oracle-v86",
-      browser_required: false, error: bootError
-    });
   }
 
   if (url.pathname === "/exec" && req.method === "POST") {
     if (!authorized(req)) return sendJson(res, 401, { error: "unauthorized" });
-    if (bootState !== "ready") {
-      return sendJson(res, 503, { error: "vm_not_ready", status: bootState, detail: bootError });
-    }
     const identity = String(req.headers["x-account-id"] || "");
     if (!/^acct-[a-f0-9-]{36}$/.test(identity)) {
       return sendJson(res, 400, { error: "invalid_account_id" });
     }
     let body;
     try { body = await readJson(req); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
-    if (typeof body.command !== "string" || !body.command.trim() || body.command.length > MAX_COMMAND_LENGTH) {
+    catch (error) { return sendJson(res, 400, { error: error.message }); }
+    if (typeof body.command !== "string" || !body.command.trim() ||
+        body.command.length > MAX_COMMAND_LENGTH) {
       return sendJson(res, 400, { error: "command_must_be_1_to_4096_characters" });
     }
     const requested = Number(body.timeout_ms) || DEFAULT_TIMEOUT_MS;
-    const timeout = Math.max(1000, Math.min(requested, 20000));
-    const result = await executeCommand(body.command, timeout);
-    return sendJson(res, result.status, { vm_id: identity, ...result.body });
+    const timeout = Math.max(1000, Math.min(requested, MAX_TIMEOUT_MS));
+    try {
+      const result = await executeCommand(identity, body.command, timeout);
+      return sendJson(res, result.status, { vm_id: identity, ...result.body });
+    } catch (error) {
+      return sendJson(res, 500, { error: "execution_failed", detail: error.message });
+    }
   }
 
   return sendJson(res, 404, { error: "not_found" });
 });
 
+await fs.mkdir(SESSIONS_DIR, { recursive: true, mode: 0o700 });
 server.listen(PORT, HOST, () => {
-  console.log("Oracle VM executor listening on http://" + HOST + ":" + PORT);
-  void startVm();
+  console.log("Oracle persistent host executor listening on http://" + HOST + ":" + PORT);
+  console.log("Runtime: native " + process.arch + "; no guest VM or ISO required.");
 });
 
 function shutdown() {
-  try { emulator?.stop(); } catch {}
+  // systemd may restart this process; completed session metadata stays on disk.
+  // The service intentionally does not attempt to serialize live shell processes.
   server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
