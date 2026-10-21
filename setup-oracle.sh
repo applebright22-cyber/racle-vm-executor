@@ -18,44 +18,30 @@ if [ "$NODE_MAJOR" -lt 22 ]; then
   sudo dnf install -y nodejs
 fi
 
-read -r -p "Cloudflare Worker URL (e.g. https://your-worker.workers.dev): " WORKER_URL
-read -r -s -p "Admin access code (used only to download the existing baseline snapshot): " ADMIN_ACCESS_CODE
-echo
-if [ -z "$WORKER_URL" ] || [ -z "$ADMIN_ACCESS_CODE" ]; then
-  echo "Worker URL and admin code are required." >&2
-  exit 1
+# Reuse the existing service token so the current Cloudflare Worker configuration
+# remains valid. Only create a new token on a first install.
+EXECUTOR_TOKEN=""
+if sudo test -f "$ENV_FILE"; then
+  EXECUTOR_TOKEN="$(sudo sed -n 's/^ORACLE_EXECUTOR_TOKEN=//p' "$ENV_FILE" | head -n 1 || true)"
 fi
-WORKER_URL="${WORKER_URL%/}"
-export WORKER_URL ADMIN_ACCESS_CODE
+TOKEN_CREATED="false"
+if [ -z "$EXECUTOR_TOKEN" ]; then
+  EXECUTOR_TOKEN="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("hex"))')"
+  TOKEN_CREATED="true"
+fi
 
-echo "Installing the pinned v86 dependency..."
+echo "Installing the dependency-free native host executor..."
 npm install --no-audit --no-fund
+mkdir -p sessions
+chmod 700 sessions
+node --check server.js
+bash -n setup-oracle.sh
 
-echo "Downloading the exact BIOS and TinyCore CD-ROM assets used by the saved VM..."
-mkdir -p bios boot
-curl -fsSL --retry 3 "$WORKER_URL/bios/seabios.bin" -o bios/seabios.bin
-curl -fsSL --retry 3 "$WORKER_URL/bios/vgabios.bin" -o bios/vgabios.bin
-curl -fsSL --retry 3 "$WORKER_URL/boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso" -o boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso
-test -s bios/seabios.bin
-test -s bios/vgabios.bin
-test -s boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso
-
-echo "Downloading and verifying the existing Admin snapshot (it will not be regenerated)..."
-python3 ./download-snapshot.py
-
-EXECUTOR_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 NODE_PATH="$(command -v node)"
-
-sudo install -o root -g root -m 600 /dev/null "$ENV_FILE"
 sudo tee "$ENV_FILE" >/dev/null <<EOF
 PORT=8787
 HOST=0.0.0.0
-WORKER_URL=$WORKER_URL
-SNAPSHOT_PATH=$APP_DIR/admin.snapshot
-WASM_PATH=$APP_DIR/node_modules/v86/build/v86.wasm
-BIOS_PATH=$APP_DIR/bios/seabios.bin
-VGA_BIOS_PATH=$APP_DIR/bios/vgabios.bin
-CDROM_PATH=$APP_DIR/boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso
+SESSIONS_DIR=$APP_DIR/sessions
 ORACLE_EXECUTOR_TOKEN=$EXECUTOR_TOKEN
 EOF
 sudo chown root:root "$ENV_FILE"
@@ -63,7 +49,7 @@ sudo chmod 600 "$ENV_FILE"
 
 sudo tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
-Description=Oracle v86 VM Executor
+Description=Oracle Persistent Host Executor
 After=network-online.target
 Wants=network-online.target
 
@@ -73,8 +59,11 @@ User=$(id -un)
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
 ExecStart=$NODE_PATH $APP_DIR/server.js
-Restart=on-failure
+Restart=always
 RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=5
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -82,15 +71,20 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable oracle-vm-executor
-sudo systemctl restart oracle-vm-executor || true
+sudo systemctl restart oracle-vm-executor
 sleep 2
-sudo systemctl --no-pager --full status oracle-vm-executor || true
 
 echo
-echo "Executor endpoint: http://141.148.53.68:8787"
-echo "Executor token: $EXECUTOR_TOKEN"
-echo "Configure this token as Cloudflare Worker secret ORACLE_EXECUTOR_TOKEN."
-echo "Set ORACLE_EXECUTOR_URL to http://141.148.53.68:8787 and deploy the Worker."
-echo "The executor checks snapshot/device compatibility before restoring and only reports ready after a shell handshake."
-echo "Check startup details with: sudo journalctl -u oracle-vm-executor -n 80 --no-pager"
-echo "The 5-digit Admin code was used only for snapshot download and was not saved in the executor environment."
+echo "Oracle persistent executor: http://$(hostname -I | awk '{print $1}'):8787"
+curl -fsS http://127.0.0.1:8787/health || true
+echo
+if [ "$TOKEN_CREATED" = "true" ]; then
+  echo "A new ORACLE_EXECUTOR_TOKEN was created. Set this same value as the Cloudflare Worker's ORACLE_EXECUTOR_TOKEN secret:"
+  echo "$EXECUTOR_TOKEN"
+else
+  echo "Existing ORACLE_EXECUTOR_TOKEN preserved; the Worker secret does not need to change."
+fi
+echo
+echo "Set the existing Worker's ORACLE_EXECUTOR_URL to the endpoint URL above if it is not already configured."
+echo "No guest VM, snapshot download, ISO, BIOS, or v86 package is required."
+echo "Logs: sudo journalctl -u oracle-vm-executor -n 60 --no-pager"
