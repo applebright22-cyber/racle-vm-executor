@@ -84,13 +84,27 @@ function checkSnapshotCompatibility(snapshotBuffer, freshBuffer) {
   const actual = fresh.metadata.buffer_infos;
   const differences = [];
   for (let i = 0; i < Math.max(expected.length, actual.length); i++) {
-    const a = expected[i]?.length;
-    const b = actual[i]?.length;
-    if (a !== b) differences.push({ index: i, snapshot: a ?? null, runtime: b ?? null });
+    const a = expected[i];
+    const b = actual[i];
+    if (!a || !b || a.length !== b.length || a.offset !== b.offset) {
+      differences.push({
+        index: i,
+        snapshot: a ? { offset: a.offset, length: a.length } : null,
+        runtime: b ? { offset: b.offset, length: b.length } : null
+      });
+    }
+  }
+  if (Array.isArray(saved.metadata.state) && Array.isArray(fresh.metadata.state) &&
+      saved.metadata.state.length !== fresh.metadata.state.length) {
+    differences.push({
+      index: "state",
+      snapshot: { entries: saved.metadata.state.length },
+      runtime: { entries: fresh.metadata.state.length }
+    });
   }
   if (differences.length) {
     const first = differences.slice(0, 8).map(x =>
-      x.index + ":" + (x.snapshot ?? "missing") + "/" + (x.runtime ?? "missing")
+      x.index + ":" + JSON.stringify(x.snapshot) + "/" + JSON.stringify(x.runtime)
     ).join(", ");
     throw new Error("snapshot_machine_config_mismatch: snapshot_buffers=" + expected.length +
       ", runtime_buffers=" + actual.length + ", first_differences=" + first +
