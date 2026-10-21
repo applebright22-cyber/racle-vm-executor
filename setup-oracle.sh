@@ -74,17 +74,64 @@ sudo systemctl enable oracle-vm-executor
 sudo systemctl restart oracle-vm-executor
 sleep 2
 
-echo
-echo "Oracle persistent executor: http://$(hostname -I | awk '{print $1}'):8787"
-curl -fsS http://127.0.0.1:8787/health || true
-echo
-if [ "$TOKEN_CREATED" = "true" ]; then
-  echo "A new ORACLE_EXECUTOR_TOKEN was created. Set this same value as the Cloudflare Worker's ORACLE_EXECUTOR_TOKEN secret:"
-  echo "$EXECUTOR_TOKEN"
-else
-  echo "Existing ORACLE_EXECUTOR_TOKEN preserved; the Worker secret does not need to change."
+if ! curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+  echo "Oracle executor did not become healthy. Check: sudo journalctl -u oracle-vm-executor -n 60 --no-pager" >&2
+  exit 1
 fi
+
+DEFAULT_WORKER_URL="https://cloudflare-container-networking.brightlambre22-6dd.workers.dev"
+read -r -p "Cloudflare Worker URL [$DEFAULT_WORKER_URL]: " WORKER_URL
+WORKER_URL="${WORKER_URL:-$DEFAULT_WORKER_URL}"
+WORKER_URL="${WORKER_URL%/}"
+if [[ ! "$WORKER_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+  echo "Worker URL must be an https:// origin, with no path." >&2
+  exit 1
+fi
+
+DEFAULT_PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+read -r -p "Oracle public IPv4 address [${DEFAULT_PUBLIC_IP}]: " ORACLE_PUBLIC_IP
+ORACLE_PUBLIC_IP="${ORACLE_PUBLIC_IP:-$DEFAULT_PUBLIC_IP}"
+if [[ ! "$ORACLE_PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo "Could not determine a public IPv4 address. Re-run setup and enter the Oracle public IPv4 address." >&2
+  exit 1
+fi
+EXECUTOR_URL="http://${ORACLE_PUBLIC_IP}:8787"
+
+read -r -s -p "Enter the existing 5-digit Cloudflare Admin access code: " ADMIN_CODE
 echo
-echo "Set the existing Worker's ORACLE_EXECUTOR_URL to the endpoint URL above if it is not already configured."
+if [[ ! "$ADMIN_CODE" =~ ^[0-9]{5}$ ]]; then
+  unset ADMIN_CODE
+  echo "The Admin access code must be exactly five digits." >&2
+  exit 1
+fi
+
+REGISTER_BODY="$(node -e 'process.stdout.write(JSON.stringify({executor_url:process.argv[1],executor_token:process.argv[2]}))' "$EXECUTOR_URL" "$EXECUTOR_TOKEN")"
+echo "Registering Oracle with Cloudflare..."
+if ! REGISTER_RESPONSE="$(curl -fsS --max-time 15 -X POST "$WORKER_URL/api/oracle/register" \
+  -H "x-admin-code: $ADMIN_CODE" \
+  -H "content-type: application/json" \
+  --data "$REGISTER_BODY")"; then
+  unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
+  echo "Oracle is running, but Cloudflare registration failed." >&2
+  echo "Deploy the updated Cloudflare Worker source once, then re-run: bash setup-oracle.sh" >&2
+  exit 1
+fi
+
+echo "Checking the live Cloudflare-to-Oracle connection..."
+if ! HEALTH_RESPONSE="$(curl -fsS --max-time 10 "$WORKER_URL/api/oracle/health" -H "x-admin-code: $ADMIN_CODE")"; then
+  unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
+  echo "Registration was accepted, but the end-to-end health check failed." >&2
+  echo "Check Oracle ingress TCP/8787 and the Cloudflare Worker logs, then re-run setup." >&2
+  exit 1
+fi
+unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
+
+echo
+echo "Oracle executor installed and registered."
+echo "Oracle endpoint: $EXECUTOR_URL"
+echo "Cloudflare registration: $REGISTER_RESPONSE"
+echo "End-to-end bridge check: $HEALTH_RESPONSE"
+echo "The machine-to-machine token stays on Oracle and in Cloudflare Durable Object storage; it is not printed."
+echo "No user API key is needed when the Worker receives the user's valid login session token."
 echo "No guest VM, snapshot download, ISO, BIOS, or v86 package is required."
 echo "Logs: sudo journalctl -u oracle-vm-executor -n 60 --no-pager"
