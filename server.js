@@ -198,7 +198,7 @@ function settleIfComplete(session) {
   let stdout = startAt >= 0
     ? pending.stdout.slice(startAt + pending.startMarker.length, endAt)
     : pending.stdout;
-  stdout = stdout.replace(/^\\r?\\n/, "").replace(/\\r?\\n$/, "");
+  stdout = stdout.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
   const cwdPattern = new RegExp(pending.cwdMarker + "([^\\r\\n]*)");
   const cwdMatch = cwdPattern.exec(pending.stdout.slice(endAt + endMatch[0].length));
   const cwd = cwdMatch ? cwdMatch[1].trim() : session.state.cwd;
