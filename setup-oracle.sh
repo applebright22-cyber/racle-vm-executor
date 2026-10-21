@@ -88,15 +88,6 @@ if [[ ! "$WORKER_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
   exit 1
 fi
 
-DEFAULT_PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-read -r -p "Oracle public IPv4 address [${DEFAULT_PUBLIC_IP}]: " ORACLE_PUBLIC_IP
-ORACLE_PUBLIC_IP="${ORACLE_PUBLIC_IP:-$DEFAULT_PUBLIC_IP}"
-if [[ ! "$ORACLE_PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-  echo "Could not determine a public IPv4 address. Re-run setup and enter the Oracle public IPv4 address." >&2
-  exit 1
-fi
-EXECUTOR_URL="http://${ORACLE_PUBLIC_IP}:8787"
-
 read -r -s -p "Enter the existing 5-digit Cloudflare Admin access code: " ADMIN_CODE
 echo
 if [[ ! "$ADMIN_CODE" =~ ^[0-9]{5}$ ]]; then
@@ -105,30 +96,43 @@ if [[ ! "$ADMIN_CODE" =~ ^[0-9]{5}$ ]]; then
   exit 1
 fi
 
-REGISTER_BODY="$(EXECUTOR_URL="$EXECUTOR_URL" EXECUTOR_TOKEN="$EXECUTOR_TOKEN" node -e 'process.stdout.write(JSON.stringify({executor_url:process.env.EXECUTOR_URL,executor_token:process.env.EXECUTOR_TOKEN}))')"
-echo "Registering Oracle with Cloudflare..."
+# Configure Oracle to initiate HTTPS requests to the Worker; no inbound public IP route is used.
+sudo sed -i '/^ORACLE_WORKER_URL=/d' "$ENV_FILE"
+printf 'ORACLE_WORKER_URL=%s\n' "$WORKER_URL" | sudo tee -a "$ENV_FILE" >/dev/null
+sudo systemctl restart oracle-vm-executor
+sleep 2
+
+REGISTER_BODY="$(EXECUTOR_TOKEN="$EXECUTOR_TOKEN" node -e 'process.stdout.write(JSON.stringify({executor_token:process.env.EXECUTOR_TOKEN}))')"
+echo "Registering Oracle reverse bridge with Cloudflare..."
 if ! REGISTER_RESPONSE="$(curl -fsS --max-time 15 -X POST "$WORKER_URL/api/oracle/register" \
   -H "x-admin-code: $ADMIN_CODE" \
   -H "content-type: application/json" \
   --data "$REGISTER_BODY")"; then
   unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
   echo "Oracle is running, but Cloudflare registration failed." >&2
-  echo "Deploy the updated Cloudflare Worker source once, then re-run: bash setup-oracle.sh" >&2
+  echo "Deploy the updated Cloudflare Worker source, then re-run: bash setup-oracle.sh" >&2
   exit 1
 fi
 
-echo "Checking the live Cloudflare-to-Oracle connection..."
-if ! HEALTH_RESPONSE="$(curl -fsS --max-time 10 "$WORKER_URL/api/oracle/health" -H "x-admin-code: $ADMIN_CODE")"; then
-  unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
-  echo "Registration was accepted, but the end-to-end health check failed." >&2
-  echo "Check Oracle ingress TCP/8787 and the Cloudflare Worker logs, then re-run setup." >&2
+echo "Waiting for Oracle's outbound HTTPS channel..."
+HEALTH_RESPONSE=""
+for attempt in $(seq 1 20); do
+  HEALTH_RESPONSE="$(curl -sS --max-time 5 "$WORKER_URL/api/oracle/health" -H "x-admin-code: $ADMIN_CODE" || true)"
+  if [[ "$HEALTH_RESPONSE" == *'"oracle_reachable":true'* ]]; then break; fi
+  sleep 1
+done
+unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
+
+if [[ "$HEALTH_RESPONSE" != *'"oracle_reachable":true'* ]]; then
+  echo "Registration succeeded, but Oracle has not checked in through outbound HTTPS." >&2
+  echo "Health response: $HEALTH_RESPONSE" >&2
+  echo "Check: sudo journalctl -u oracle-vm-executor -n 60 --no-pager" >&2
   exit 1
 fi
-unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
 
 echo
 echo "Oracle executor installed and registered."
-echo "Oracle endpoint: $EXECUTOR_URL"
+echo "Transport: Oracle-initiated outbound HTTPS polling; no domain or public Oracle endpoint required."
 echo "Cloudflare registration: $REGISTER_RESPONSE"
 echo "End-to-end bridge check: $HEALTH_RESPONSE"
 echo "The machine-to-machine token stays on Oracle and in Cloudflare Durable Object storage; it is not printed."
