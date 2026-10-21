@@ -271,6 +271,84 @@ async function executeCommand(identity, command, timeoutMs) {
   return result;
 }
 
+
+const WORKER_URL = (process.env.ORACLE_WORKER_URL || "").replace(/\/$/, "");
+let pollerFailures = 0;
+
+async function runOracleBridgePoller() {
+  if (!WORKER_URL || !/^https:\/\/[A-Za-z0-9.-]+(?::[0-9]+)?$/.test(WORKER_URL)) {
+    console.error("Oracle outbound bridge is not configured: set ORACLE_WORKER_URL in the service environment.");
+    return;
+  }
+  if (!EXECUTOR_TOKEN) {
+    console.error("Oracle outbound bridge is not configured: ORACLE_EXECUTOR_TOKEN is missing.");
+    return;
+  }
+  console.log("Oracle outbound HTTPS bridge polling " + WORKER_URL);
+  while (true) {
+    try {
+      const response = await fetch(WORKER_URL + "/api/oracle/next-job", {
+        headers: { "x-executor-token": EXECUTOR_TOKEN },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) throw new Error("poll_http_" + response.status);
+      const data = await response.json();
+      pollerFailures = 0;
+      const job = data.job;
+      if (!job) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue;
+      }
+
+      let status = 200;
+      let result;
+      try {
+        if (typeof job.id !== "string" || !/^[a-f0-9-]{36}$/.test(job.id) ||
+            !validIdentity(job.identity) || !["status", "exec"].includes(job.action)) {
+          status = 400;
+          result = { error: "invalid_oracle_job" };
+        } else if (job.action === "status") {
+          const session = await getSession(job.identity);
+          result = sessionSummary(session);
+        } else {
+          const payload = job.payload;
+          if (!payload || typeof payload.command !== "string" || !payload.command.trim() ||
+              payload.command.length > MAX_COMMAND_LENGTH) {
+            status = 400;
+            result = { error: "command_must_be_1_to_4096_characters" };
+          } else {
+            const requested = Number(payload.timeout_ms) || DEFAULT_TIMEOUT_MS;
+            const timeout = Math.max(1000, Math.min(requested, MAX_TIMEOUT_MS));
+            const execution = await executeCommand(job.identity, payload.command, timeout);
+            status = execution.status;
+            result = execution.body;
+          }
+        }
+      } catch (error) {
+        status = 500;
+        result = { error: "oracle_job_failed", detail: error instanceof Error ? error.message : String(error) };
+      }
+
+      const completed = await fetch(WORKER_URL + "/api/oracle/complete-job", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-executor-token": EXECUTOR_TOKEN,
+        },
+        body: JSON.stringify({ id: job.id, status, result }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!completed.ok) throw new Error("complete_http_" + completed.status);
+    } catch (error) {
+      pollerFailures += 1;
+      if (pollerFailures === 1 || pollerFailures % 20 === 0) {
+        console.error("Oracle outbound bridge connection error:", error instanceof Error ? error.message : String(error));
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000 + pollerFailures * 250, 5000)));
+    }
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
@@ -326,6 +404,7 @@ await fs.mkdir(SESSIONS_DIR, { recursive: true, mode: 0o700 });
 server.listen(PORT, HOST, () => {
   console.log("Oracle persistent host executor listening on http://" + HOST + ":" + PORT);
   console.log("Runtime: native " + process.arch + "; no guest VM or ISO required.");
+  void runOracleBridgePoller();
 });
 
 function shutdown() {
