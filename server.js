@@ -171,7 +171,6 @@ async function startVm() {
       const timer = setTimeout(() => reject(new Error("v86_init_timeout")), 30000);
       const done = () => { clearTimeout(timer); resolve(); };
       emulator.add_listener("emulator-loaded", done);
-      emulator.add_listener("emulator-ready", done);
       emulator.add_listener("download-error", e => {
         clearTimeout(timer);
         reject(new Error("v86_asset_load_failed:" + String(e)));
@@ -180,7 +179,7 @@ async function startVm() {
 
     // Reject incompatible state before restore/run. This catches missing devices and
     // memory-size differences before they become a CPU page-walk stack overflow.
-    const freshState = arrayBuffer(Buffer.from(await emulator.save_state()));
+    const freshState = await emulator.save_state();
     checkSnapshotCompatibility(snapshot, freshState);
 
     console.log("Snapshot compatibility passed; restoring the existing Admin snapshot.");
