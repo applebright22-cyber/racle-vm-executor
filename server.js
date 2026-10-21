@@ -201,7 +201,9 @@ function settleIfComplete(session) {
   stdout = stdout.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
   const cwdPattern = new RegExp(pending.cwdMarker + "([^\\r\\n]*)");
   const cwdMatch = cwdPattern.exec(pending.stdout.slice(endAt + endMatch[0].length));
-  const cwd = cwdMatch ? cwdMatch[1].trim() : session.state.cwd;
+  // stdout chunks can split between the exit marker and cwd marker; wait for both.
+  if (!cwdMatch) return;
+  const cwd = cwdMatch[1].trim();
 
   session.state.cwd = cwd.startsWith("/") ? cwd : session.workDir;
   session.state.commandCount += 1;
