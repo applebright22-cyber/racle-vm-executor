@@ -105,7 +105,7 @@ if [[ ! "$ADMIN_CODE" =~ ^[0-9]{5}$ ]]; then
   exit 1
 fi
 
-REGISTER_BODY="$(node -e 'process.stdout.write(JSON.stringify({executor_url:process.argv[1],executor_token:process.argv[2]}))' "$EXECUTOR_URL" "$EXECUTOR_TOKEN")"
+REGISTER_BODY="$(EXECUTOR_URL="$EXECUTOR_URL" EXECUTOR_TOKEN="$EXECUTOR_TOKEN" node -e 'process.stdout.write(JSON.stringify({executor_url:process.env.EXECUTOR_URL,executor_token:process.env.EXECUTOR_TOKEN}))')"
 echo "Registering Oracle with Cloudflare..."
 if ! REGISTER_RESPONSE="$(curl -fsS --max-time 15 -X POST "$WORKER_URL/api/oracle/register" \
   -H "x-admin-code: $ADMIN_CODE" \
