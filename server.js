@@ -11,6 +11,7 @@ const BIOS_PATH = process.env.BIOS_PATH || "./bios/seabios.bin";
 const VGA_BIOS_PATH = process.env.VGA_BIOS_PATH || "./bios/vgabios.bin";
 const CDROM_PATH = process.env.CDROM_PATH || "./boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso";
 const EXECUTOR_TOKEN = process.env.ORACLE_EXECUTOR_TOKEN || "";
+const WORKER_URL = process.env.WORKER_URL || "";
 const MEMORY_SIZE = 128 * 1024 * 1024;
 const VGA_MEMORY_SIZE = 8 * 1024 * 1024;
 const MAX_COMMAND_LENGTH = 4096;
@@ -139,10 +140,23 @@ async function startVm() {
     const cdrom = arrayBuffer(cdromFile);
     parseSnapshotHeader(snapshot, "snapshot");
 
-    const vmIp = process.env.VM_IP || "10.240.0.2";
-    const routerIp = process.env.ROUTER_IP || "10.240.0.1";
-    const relayUrl = process.env.NETWORK_RELAY_URL ||
-      "ws://127.0.0.1:8788/api/network/wisp/?identity=admin&ticket=offline";
+    if (!WORKER_URL) throw new Error("worker_url_not_configured");
+    if (!EXECUTOR_TOKEN) throw new Error("executor_token_not_configured");
+    const ticketResponse = await fetch(new URL("/api/oracle/network-ticket", WORKER_URL), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-executor-token": EXECUTOR_TOKEN },
+      body: JSON.stringify({ identity: "admin" }),
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!ticketResponse.ok) throw new Error("network_ticket_request_failed_http_" + ticketResponse.status);
+    const network = await ticketResponse.json();
+    if (typeof network.relay_url !== "string" ||
+        typeof network.vm_ip !== "string" || typeof network.router_ip !== "string") {
+      throw new Error("network_ticket_response_invalid");
+    }
+    const vmIp = network.vm_ip;
+    const routerIp = network.router_ip;
+    const relayUrl = network.relay_url;
 
     emulator = new V86({
       wasm_path: WASM_PATH,
