@@ -1,0 +1,12 @@
+{
+  "name": "racle-vm-executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "v86": "0.5.472"
+  }
+}
