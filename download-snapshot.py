@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import sys
-import urllib.error
 import urllib.request
 
 base = os.environ.get("WORKER_URL", "").rstrip("/")
@@ -14,7 +13,13 @@ if not base or not admin_code:
     print("Set WORKER_URL and ADMIN_ACCESS_CODE first.", file=sys.stderr)
     sys.exit(2)
 
-headers = {"x-admin-code": admin_code}
+# Cloudflare accepts this endpoint with a curl-style User-Agent; urllib's
+# default Python User-Agent was receiving HTTP 403 for the same valid code.
+headers = {
+    "x-admin-code": admin_code,
+    "User-Agent": "curl/8.5.0",
+}
+
 def get(path):
     request = urllib.request.Request(base + path, headers=headers)
     with urllib.request.urlopen(request, timeout=60) as response:
