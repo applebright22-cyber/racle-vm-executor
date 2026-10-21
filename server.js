@@ -304,9 +304,17 @@ async function runOracleBridgePoller() {
       let result;
       try {
         if (typeof job.id !== "string" || !/^[a-f0-9-]{36}$/.test(job.id) ||
-            !validIdentity(job.identity) || !["status", "exec"].includes(job.action)) {
+            !validIdentity(job.identity) || !["status", "exec", "echo"].includes(job.action)) {
           status = 400;
           result = { error: "invalid_oracle_job" };
+        } else if (job.action === "echo") {
+          const message = job.payload && typeof job.payload.message === "string" ? job.payload.message : "";
+          if (!message || message.length > 256) {
+            status = 400;
+            result = { error: "invalid_echo_message" };
+          } else {
+            result = { ok: true, vm_id: job.identity, received_by: "oracle", message };
+          }
         } else if (job.action === "status") {
           const session = await getSession(job.identity);
           result = sessionSummary(session);
