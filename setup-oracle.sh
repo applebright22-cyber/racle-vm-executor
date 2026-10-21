@@ -50,6 +50,7 @@ sudo install -o root -g root -m 600 /dev/null "$ENV_FILE"
 sudo tee "$ENV_FILE" >/dev/null <<EOF
 PORT=8787
 HOST=0.0.0.0
+WORKER_URL=$WORKER_URL
 SNAPSHOT_PATH=$APP_DIR/admin.snapshot
 WASM_PATH=$APP_DIR/node_modules/v86/build/v86.wasm
 BIOS_PATH=$APP_DIR/bios/seabios.bin
