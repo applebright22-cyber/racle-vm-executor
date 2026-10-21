@@ -1,41 +1,69 @@
-# Oracle VM Executor
+# Oracle Persistent Host Executor
 
-A browserless v86 executor for the existing Cloudflare VM API. Cloudflare keeps account API-key validation and forwards authenticated `/v1/vm/status` and `/v1/vm/exec` requests to this service.
+Oracle is the persistent execution layer behind the existing Cloudflare VM API. It runs network commands directly on the Oracle Linux host and keeps an account-specific shell session available after the browser user logs out.
 
-## Snapshot compatibility
+**This service does not boot a second VM.** It does not need v86, the TinyCore ISO, BIOS images, or an Admin VM snapshot. The existing Cloudflare project and its ISO/browser UI are not rebuilt by this repository.
 
-The Admin snapshot was created by `public/vm.html` in the Cloudflare repository. The saved machine configuration is v86 `0.5.472`, 128 MiB guest RAM, 8 MiB VGA RAM, the exact TinyCore ISO at `/boot/TinyCorePure64-11.0-v86-ne2k-dhcp-experimental.iso`, and an NE2K network device with keyboard enabled and mouse disabled.
+## How it works
 
-The executor recreates those devices, waits for `emulator-loaded`, and compares the saved v86 buffer layout against a fresh state before restoring. It fails with `snapshot_machine_config_mismatch` instead of running a mismatched guest and crashing in the CPU page walker. The existing Admin snapshot is downloaded and verified; setup does not generate a replacement.
+- Cloudflare continues to authenticate users and forward the existing `/v1/vm/status` and `/v1/vm/exec` API calls.
+- Oracle accepts the same internal `/status` and `/exec` calls, using the existing `x-executor-token` and account ID headers.
+- Each `acct-...` account gets its own long-lived Bash process on Oracle, a separate working directory under `sessions/<account-id>/work`, and a small on-disk session record.
+- Shell state such as the current directory and exported variables remains in the live shell while the service runs. The working directory and basic session metadata are saved to disk.
+- The systemd service starts at boot and restarts automatically. A browser logout does not stop Oracle or its shell sessions.
 
-## Install on Oracle Linux 8
+The account/session boundary is keyed by the same account ID Cloudflare already passes. This is a persistent Oracle shell session, **not** a byte-for-byte mirror of the browser VM's RAM or its interactive terminal. Automatically mirroring arbitrary browser shell state would require the existing Cloudflare browser client to send that state; this repo deliberately does not change that project.
 
-Run as the Oracle `opc` user with `sudo` access:
+## Install or update on Oracle Linux
 
-```bash
-git clone https://github.com/applebright22-cyber/racle-vm-executor.git
-cd racle-vm-executor
+Run as the Oracle `opc` user with sudo access:
+
+```sh
+cd ~/racle-vm-executor
+git pull --ff-only
 bash setup-oracle.sh
 ```
 
-Setup installs Node.js 22+ if needed, installs the pinned v86 package, downloads the matching BIOS/VGA BIOS/TinyCore ISO, downloads and verifies the existing Admin snapshot, and writes the service environment to root-owned `/etc/oracle-vm-executor.env`. The five-digit Admin code is used only to download the snapshot; it is not stored on Oracle.
+The setup script installs the dependency-free Node.js service, creates the persistent session directory, and configures systemd. It reuses the existing `ORACLE_EXECUTOR_TOKEN` from `/etc/oracle-vm-executor.env` so the current Cloudflare Worker secret remains valid. It only creates and prints a token on a first install when no token exists.
 
-## Connect and start
+It does not download or replace `admin.snapshot`, and it does not require the five-digit Admin code.
 
-1. Setup prints `ORACLE_EXECUTOR_TOKEN` after installing the service.
-2. In the Cloudflare Worker project, set the secret with `npx wrangler secret put ORACLE_EXECUTOR_TOKEN` and paste that exact token.
-3. Deploy the Worker. The current Worker code includes `/api/oracle/network-ticket`, which uses the same executor token to obtain a fresh short-lived WISP ticket. This avoids storing the Admin code on Oracle.
-4. Restart Oracle so it can obtain a fresh network ticket: `sudo systemctl restart oracle-vm-executor`.
-5. Check startup with `sudo journalctl -u oracle-vm-executor -n 100 --no-pager` and `curl -sS http://127.0.0.1:8787/health`.
+## Existing Cloudflare configuration
 
-The Worker must be deployed with the new route before the Oracle service can become ready. Allow TCP/8787 through the applicable Oracle Cloud and host firewall rules so the Worker can reach the executor.
+Keep the current Worker deployment and routes. Ensure its existing secrets/config point to this Oracle endpoint:
 
-## Runtime behavior
+- `ORACLE_EXECUTOR_URL`: `http://<oracle-host-public-ip>:8787`
+- `ORACLE_EXECUTOR_TOKEN`: the existing token already configured in Oracle's root-owned environment file and in the Worker secret.
 
-- `GET /health`: startup status and the exact startup error.
-- `GET /status?identity=admin`: authenticated status endpoint used by the Worker.
-- `POST /exec`: sends a command through v86 keyboard input to the restored VGA shell and checks for unique completion markers. It does not assume the guest has a serial shell.
-- The service reports `ready` only after snapshot-layout compatibility, restore, and an interactive TinyCore shell handshake succeed.
-- Only one command is dispatched at a time. Output is limited to text still visible in the guest terminal; this version does not implement full scrollback capture or per-account snapshot persistence.
+Allow inbound TCP/8787 in the Oracle Cloud network security list/security list and host firewall, if your current deployment uses direct inbound HTTP. If the existing Worker connects through another already-configured path, keep using that path.
 
-The current Oracle process runs the Admin baseline only. The account ID is preserved at the API boundary, but per-account guest selection and snapshot persistence are not yet implemented.
+## API
+
+All responses are JSON.
+
+- `GET /health` — host service health; no guest-VM startup is required.
+- `GET /status?identity=acct-<uuid>` — requires `x-executor-token`; returns the account session status.
+- `POST /exec` — requires `x-executor-token`, `x-account-id: acct-<uuid>`, and JSON such as:
+
+```json
+{
+  "command": "pwd; uname -a",
+  "timeout_ms": 15000
+}
+```
+
+The response includes `stdout`, `stderr`, `exit_code`, `execution_id`, and `runtime: "oracle-host"`. One command runs at a time per account; separate accounts can execute concurrently. If a command exceeds the HTTP timeout, the API returns a timeout response but deliberately leaves the command running and keeps that account's shell occupied until the command finishes.
+
+Commands execute as the Linux user running the service (normally `opc`), not as root. The endpoint can run arbitrary shell commands, so possession of the executor token grants that level of command execution; keep the token private.
+
+## Verify
+
+```sh
+npm run check
+bash -n setup-oracle.sh
+sudo systemctl status oracle-vm-executor --no-pager
+curl -fsS http://127.0.0.1:8787/health
+sudo journalctl -u oracle-vm-executor -n 60 --no-pager
+```
+
+Session metadata is stored in `sessions/` and is excluded from Git. Live shell processes and in-memory shell variables do not survive a service/host restart; the service and session directory are restored automatically, and the saved working directory is reused.
