@@ -44,7 +44,7 @@ sudo systemctl status oracle-vm-executor --no-pager
 sudo journalctl -u oracle-vm-executor -n 60 --no-pager
 ```
 
-A healthy service reports `runtime: "oracle-host"` and `cloudflare_agent_connected: true` when its WebSocket is connected. A healthy local process alone does not prove the Worker connection is online.
+A healthy service reports `runtime: "oracle-host"` and `cloudflare_agent_connected: true` when its WebSocket is connected. The health response also reports `guest_network_relay: false`: this repository executes persistent Oracle host commands but does not forward TinyCore guest packets. Guest Internet traffic uses the separate Cloudflare WISP relay at `/api/network/wisp/`. A healthy local process alone does not prove the Worker connection is online or that guest networking works.
 
 ## Local API
 
