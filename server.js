@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 8787);
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = process.env.HOST || "127.0.0.1";
 const EXECUTOR_TOKEN = process.env.ORACLE_EXECUTOR_TOKEN || "";
 const SESSIONS_DIR = path.resolve(process.env.SESSIONS_DIR || "./sessions");
 const MAX_COMMAND_LENGTH = 4096;
