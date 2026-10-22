@@ -135,15 +135,16 @@ function startShell(session) {
   const child = spawn("/bin/bash", ["--noprofile", "--norc"], {
     cwd: session.state.cwd,
     env,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: true
   });
   session.process = child;
 
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stdout.on("data", chunk => {
-    const pending = session.pending;
-    if (!pending) return;
+    const pending = session.process === child ? session.pending : null;
+    if (!pending || pending.timingOut) return;
     pending.stdout += chunk;
     if (pending.stdout.length > MAX_CAPTURE_BYTES * 2) {
       pending.stdout = pending.stdout.slice(-MAX_CAPTURE_BYTES);
@@ -152,8 +153,8 @@ function startShell(session) {
     settleIfComplete(session);
   });
   child.stderr.on("data", chunk => {
-    const pending = session.pending;
-    if (!pending) return;
+    const pending = session.process === child ? session.pending : null;
+    if (!pending || pending.timingOut) return;
     pending.stderr += chunk;
     if (pending.stderr.length > MAX_CAPTURE_BYTES) {
       pending.stderr = pending.stderr.slice(-MAX_CAPTURE_BYTES);
@@ -161,17 +162,19 @@ function startShell(session) {
     }
   });
   child.on("error", error => {
-    const pending = session.pending;
+    if (session.process !== child) return;
     session.process = null;
-    if (pending) finishPending(session, {
+    const pending = session.pending;
+    if (pending && !pending.timingOut) finishPending(session, {
       status: 500,
       body: { error: "shell_start_failed", detail: error.message }
     });
   });
   child.on("exit", (code, signal) => {
-    if (session.process === child) session.process = null;
+    if (session.process !== child) return;
+    session.process = null;
     const pending = session.pending;
-    if (pending) finishPending(session, {
+    if (pending && !pending.timingOut) finishPending(session, {
       status: 500,
       body: { error: "shell_session_ended", exit_code: code, signal }
     });
@@ -188,7 +191,7 @@ function finishPending(session, result) {
 
 function settleIfComplete(session) {
   const pending = session.pending;
-  if (!pending) return;
+  if (!pending || pending.timingOut) return;
   const endPattern = new RegExp(pending.endMarker + ":(-?\\d+)\\r?\\n");
   const endMatch = endPattern.exec(pending.stdout);
   if (!endMatch) return;
@@ -228,6 +231,30 @@ function settleIfComplete(session) {
   });
 }
 
+function terminateTimedOutShell(session) {
+  const child = session.process;
+  if (!child || child.exitCode !== null || !child.pid) {
+    if (session.process === child) session.process = null;
+    return Promise.resolve();
+  }
+
+  const signalGroup = signal => {
+    try { process.kill(-child.pid, signal); }
+    catch (error) {
+      if (error && error.code !== "ESRCH") {
+        try { child.kill(signal); } catch { /* already exited */ }
+      }
+    }
+  };
+  signalGroup("SIGTERM");
+  return new Promise(resolve => {
+    setTimeout(() => {
+      signalGroup("SIGKILL");
+      if (session.process === child) session.process = null;
+      resolve();
+    }, 500);
+  });
+}
 async function executeCommand(identity, command, timeoutMs) {
   const session = await getSession(identity);
   if (session.pending) {
@@ -245,15 +272,22 @@ async function executeCommand(identity, command, timeoutMs) {
   const result = await new Promise(resolve => {
     const pending = {
       id, startMarker, endMarker, cwdMarker,
-      stdout: "", stderr: "", truncated: false, resolve, timeout: null
+      stdout: "", stderr: "", truncated: false, resolve, timeout: null, timingOut: false
     };
     session.pending = pending;
     pending.timeout = setTimeout(() => {
-      // The command is deliberately left running. Its shell remains busy until it
-      // finishes, so a later request cannot accidentally interleave with it.
-      resolve({
-        status: 504,
-        body: { error: "execution_timeout", execution_id: id, timed_out: true, command_still_running: true }
+      pending.timingOut = true;
+      void terminateTimedOutShell(session).then(() => {
+        if (session.pending !== pending) return;
+        session.state.commandCount += 1;
+        session.state.lastExitCode = 124;
+        void saveSessionState(session).catch(error => {
+          console.error("Session state save failed for " + session.identity + ":", error.message);
+        });
+        finishPending(session, {
+          status: 504,
+          body: { error: "execution_timeout", execution_id: id, timed_out: true, command_still_running: false }
+        });
       });
     }, timeoutMs);
 
@@ -326,7 +360,8 @@ async function handleAgentMessage(socket, data) {
       exit_code: Number.isInteger(body.exit_code)
         ? body.exit_code
         : execution.status === 200 ? 0 : execution.status === 504 ? 124 : 125,
-      timed_out: execution.status === 504 || body.timed_out === true
+      timed_out: execution.status === 504 || body.timed_out === true,
+      ...(typeof body.command_still_running === "boolean" ? { command_still_running: body.command_still_running } : {})
     };
   } catch (error) {
     result = {
