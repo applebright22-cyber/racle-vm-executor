@@ -42,9 +42,10 @@ test("rejects a checkpoint with a wrong digest and does not publish latest", asy
   await withStore(async (store) => {
     const identity = "acct-12345678-1234-1234-1234-123456789abc";
     const generation = "bad-generation";
-    await store.putChunk(identity, generation, 0, Buffer.from("not the expected bytes"));
+    const bytes = Buffer.from("not the expected bytes");
+    await store.putChunk(identity, generation, 0, bytes);
     await assert.rejects(
-      store.commit(identity, generation, { chunks: 1, byte_length: 21, sha256: "0".repeat(64) }),
+      store.commit(identity, generation, { chunks: 1, byte_length: bytes.length, sha256: "0".repeat(64) }),
       /checkpoint_digest_mismatch/
     );
     await assert.rejects(store.getManifest(identity, "latest"));
