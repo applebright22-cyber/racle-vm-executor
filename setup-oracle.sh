@@ -128,33 +128,4 @@ echo "Oracle executor installed and connected to Cloudflare."
 echo "Transport: Oracle-initiated outbound HTTPS/WebSocket; no inbound Oracle port is required."
 echo "The existing Cloudflare Worker and public API were not modified."
 echo "No per-user API key is needed for the Admin connection."
-echo "Logs: sudo journalctl -u oracle-vm-executor -n 60 --no-pager"  echo "Oracle is running, but Cloudflare registration failed." >&2
-  echo "Deploy the updated Cloudflare Worker source, then re-run: bash setup-oracle.sh" >&2
-  exit 1
-fi
-
-echo "Waiting for Oracle's outbound HTTPS channel..."
-HEALTH_RESPONSE=""
-for attempt in $(seq 1 20); do
-  HEALTH_RESPONSE="$(curl -sS --max-time 5 "$WORKER_URL/api/oracle/health" -H "x-admin-code: $ADMIN_CODE" || true)"
-  if [[ "$HEALTH_RESPONSE" == *'"oracle_reachable":true'* ]]; then break; fi
-  sleep 1
-done
-unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
-
-if [[ "$HEALTH_RESPONSE" != *'"oracle_reachable":true'* ]]; then
-  echo "Registration succeeded, but Oracle has not checked in through outbound HTTPS." >&2
-  echo "Health response: $HEALTH_RESPONSE" >&2
-  echo "Check: sudo journalctl -u oracle-vm-executor -n 60 --no-pager" >&2
-  exit 1
-fi
-
-echo
-echo "Oracle executor installed and registered."
-echo "Transport: Oracle-initiated outbound HTTPS polling; no domain or public Oracle endpoint required."
-echo "Cloudflare registration: $REGISTER_RESPONSE"
-echo "End-to-end bridge check: $HEALTH_RESPONSE"
-echo "The machine-to-machine token stays on Oracle and in Cloudflare Durable Object storage; it is not printed."
-echo "No user API key is needed when the Worker receives the user's valid login session token."
-echo "No guest VM, snapshot download, ISO, BIOS, or v86 package is required."
 echo "Logs: sudo journalctl -u oracle-vm-executor -n 60 --no-pager"
