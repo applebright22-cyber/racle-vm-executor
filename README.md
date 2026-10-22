@@ -2,7 +2,10 @@
 
 Oracle is the persistent execution layer behind the existing Cloudflare VM API. It runs account-scoped Bash sessions on the Oracle Linux host and maintains an outbound WebSocket connection to Cloudflare. The existing Cloudflare Worker and public API are not rebuilt or modified by this repository.
 
-**This is a persistent Oracle host shell, not a byte-for-byte mirror of browser VM RAM or a shell inside the Tiny Core guest.** The existing Worker currently routes its VM execution API to the Admin identity; this bridge connects as `admin`.
+**This is a persistent Oracle host shell, not a byte-for-byte mirror of browser VM RAM or a shell inside the Tiny Core guest.**
+
+> **Multi-user safety gate:** account-named session directories do not isolate arbitrary shell commands. Commands run with the Linux permissions of the service user (normally `opc`). Do not expose the host shell as a normal-user terminal or route untrusted account commands to the shared `oracle` agent until per-account OS/container isolation and end-to-end identity validation are implemented and tested. The installer binds the local HTTP API to `127.0.0.1`; the Cloudflare agent uses an outbound WebSocket.
+ The existing Worker currently routes its VM execution API to the Admin identity; this bridge connects as `admin`.
 
 ## How it works
 
