@@ -96,20 +96,39 @@ if [[ ! "$ADMIN_CODE" =~ ^[0-9]{5}$ ]]; then
   exit 1
 fi
 
-# Configure Oracle to initiate HTTPS requests to the Worker; no inbound public IP route is used.
-sudo sed -i '/^ORACLE_WORKER_URL=/d' "$ENV_FILE"
-printf 'ORACLE_WORKER_URL=%s\n' "$WORKER_URL" | sudo tee -a "$ENV_FILE" >/dev/null
-sudo systemctl restart oracle-vm-executor
-sleep 2
+# Store the Admin code in the root-owned 0600 environment file. Oracle uses it only
+# to request short-lived WebSocket tickets; it is never sent to end users.
+sudo sed -i '/^ORACLE_WORKER_URL=/d;/^ORACLE_ADMIN_CODE=/d' "$ENV_FILE"
+printf 'ORACLE_WORKER_URL=%s\nORACLE_ADMIN_CODE=%s\n' "$WORKER_URL" "$ADMIN_CODE" | sudo tee -a "$ENV_FILE" >/dev/null
+sudo chown root:root "$ENV_FILE"
+sudo chmod 600 "$ENV_FILE"
+unset ADMIN_CODE
 
-REGISTER_BODY="$(EXECUTOR_TOKEN="$EXECUTOR_TOKEN" node -e 'process.stdout.write(JSON.stringify({executor_token:process.env.EXECUTOR_TOKEN}))')"
-echo "Registering Oracle reverse bridge with Cloudflare..."
-if ! REGISTER_RESPONSE="$(curl -fsS --max-time 15 -X POST "$WORKER_URL/api/oracle/register" \
-  -H "x-admin-code: $ADMIN_CODE" \
-  -H "content-type: application/json" \
-  --data "$REGISTER_BODY")"; then
-  unset ADMIN_CODE EXECUTOR_TOKEN REGISTER_BODY
-  echo "Oracle is running, but Cloudflare registration failed." >&2
+sudo systemctl restart oracle-vm-executor
+echo "Waiting for Oracle's outbound Cloudflare WebSocket connection..."
+HEALTH_RESPONSE=""
+for attempt in $(seq 1 30); do
+  HEALTH_RESPONSE="$(curl -sS --max-time 5 http://127.0.0.1:8787/health || true)"
+  if [[ "$HEALTH_RESPONSE" == *'"cloudflare_agent_connected":true'* ]]; then break; fi
+  sleep 1
+done
+
+unset EXECUTOR_TOKEN
+
+if [[ "$HEALTH_RESPONSE" != *'"cloudflare_agent_connected":true'* ]]; then
+  echo "Oracle service is running, but its Cloudflare WebSocket agent did not connect." >&2
+  echo "Health response: $HEALTH_RESPONSE" >&2
+  echo "Check: sudo journalctl -u oracle-vm-executor -n 60 --no-pager" >&2
+  echo "Verify that the Admin code matches Cloudflare's ADMIN_ACCESS_CODE secret." >&2
+  exit 1
+fi
+
+echo
+echo "Oracle executor installed and connected to Cloudflare."
+echo "Transport: Oracle-initiated outbound HTTPS/WebSocket; no inbound Oracle port is required."
+echo "The existing Cloudflare Worker and public API were not modified."
+echo "No per-user API key is needed for the Admin connection."
+echo "Logs: sudo journalctl -u oracle-vm-executor -n 60 --no-pager"  echo "Oracle is running, but Cloudflare registration failed." >&2
   echo "Deploy the updated Cloudflare Worker source, then re-run: bash setup-oracle.sh" >&2
   exit 1
 fi
