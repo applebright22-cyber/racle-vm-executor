@@ -300,7 +300,7 @@ async function handleAgentMessage(socket, data) {
   const timeout = Math.max(1000, Math.min(Number(request.timeout_ms) || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS));
   let result;
   try {
-    const execution = await executeCommand("admin", request.command, timeout);
+    const execution = await executeCommand("oracle", request.command, timeout);
     const body = execution.body || {};
     result = {
       type: "result",
@@ -351,7 +351,10 @@ async function runOracleAgent() {
     try {
       const ticketResponse = await fetch(WORKER_URL + "/api/vm/agent-ticket", {
         method: "POST",
-        headers: { "x-admin-code": ORACLE_ADMIN_CODE },
+        headers: {
+          "x-admin-code": ORACLE_ADMIN_CODE,
+          "x-agent-identity": "oracle"
+        },
         signal: AbortSignal.timeout(10000)
       });
       if (!ticketResponse.ok) {
@@ -364,7 +367,7 @@ async function runOracleAgent() {
       }
 
       const wsUrl = WORKER_URL.replace(/^https:/, "wss:") +
-        "/api/vm/agent?ticket=" + encodeURIComponent(ticketData.ticket);
+        "/api/vm/agent?identity=oracle&ticket=" + encodeURIComponent(ticketData.ticket);
 
       await new Promise((resolve, reject) => {
         const socket = new WebSocket(wsUrl);
