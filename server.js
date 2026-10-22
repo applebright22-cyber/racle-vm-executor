@@ -430,7 +430,8 @@ const server = http.createServer(async (req, res) => {
       runtime: "oracle-host",
       architecture: process.arch,
       execution_available: true,
-      persistent_sessions: true
+      persistent_sessions: true,
+      cloudflare_agent_connected: typeof WebSocket === "function" && agentSocket?.readyState === WebSocket.OPEN
     });
   }
 
