@@ -273,88 +273,151 @@ async function executeCommand(identity, command, timeoutMs) {
 
 
 const WORKER_URL = (process.env.ORACLE_WORKER_URL || "").replace(/\/$/, "");
-let pollerFailures = 0;
+const ORACLE_ADMIN_CODE = process.env.ORACLE_ADMIN_CODE || process.env.ADMIN_ACCESS_CODE || "";
+let agentSocket = null;
+let reconnectFailures = 0;
 
-async function runOracleBridgePoller() {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function handleAgentMessage(socket, data) {
+  let request;
+  try {
+    request = JSON.parse(typeof data === "string" ? data : String(data));
+  } catch {
+    console.warn("Ignoring invalid JSON from Cloudflare VM coordinator.");
+    return;
+  }
+
+  if (!request || request.type !== "exec" || typeof request.id !== "string" ||
+      typeof request.command !== "string" || !request.command.trim() ||
+      request.command.length > MAX_COMMAND_LENGTH) {
+    console.warn("Ignoring invalid Cloudflare execution request.");
+    return;
+  }
+
+  const timeout = Math.max(1000, Math.min(Number(request.timeout_ms) || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS));
+  let result;
+  try {
+    const execution = await executeCommand("admin", request.command, timeout);
+    const body = execution.body || {};
+    result = {
+      type: "result",
+      id: request.id,
+      stdout: typeof body.stdout === "string" ? body.stdout : "",
+      stderr: typeof body.stderr === "string" ? body.stderr : (body.error ? String(body.error) : ""),
+      exit_code: Number.isInteger(body.exit_code)
+        ? body.exit_code
+        : execution.status === 200 ? 0 : execution.status === 504 ? 124 : 125,
+      timed_out: execution.status === 504 || body.timed_out === true
+    };
+  } catch (error) {
+    result = {
+      type: "result",
+      id: request.id,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      exit_code: 125,
+      timed_out: false
+    };
+  }
+
+  if (socket.readyState === WebSocket.OPEN) {
+    try {
+      socket.send(JSON.stringify(result));
+    } catch (error) {
+      console.error("Could not return command result to Cloudflare:", error instanceof Error ? error.message : String(error));
+    }
+  }
+}
+
+async function runOracleAgent() {
   if (!WORKER_URL || !/^https:\/\/[A-Za-z0-9.-]+(?::[0-9]+)?$/.test(WORKER_URL)) {
-    console.error("Oracle outbound bridge is not configured: set ORACLE_WORKER_URL in the service environment.");
+    console.error("Oracle Cloudflare agent is not configured: set ORACLE_WORKER_URL to the Worker HTTPS origin.");
     return;
   }
-  if (!EXECUTOR_TOKEN) {
-    console.error("Oracle outbound bridge is not configured: ORACLE_EXECUTOR_TOKEN is missing.");
+  if (!ORACLE_ADMIN_CODE) {
+    console.error("Oracle Cloudflare agent is not configured: set ORACLE_ADMIN_CODE to the same Admin access code configured in Cloudflare.");
     return;
   }
-  console.log("Oracle outbound HTTPS bridge polling " + WORKER_URL);
+  if (typeof WebSocket !== "function") {
+    console.error("Oracle Cloudflare agent requires Node.js with the built-in WebSocket client (Node.js 22 or newer).");
+    return;
+  }
+
+  console.log("Oracle outbound WebSocket agent connecting to " + WORKER_URL + " as Admin.");
   while (true) {
     try {
-      const response = await fetch(WORKER_URL + "/api/oracle/next-job", {
-        headers: { "x-executor-token": EXECUTOR_TOKEN },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!response.ok) throw new Error("poll_http_" + response.status);
-      const data = await response.json();
-      pollerFailures = 0;
-      const job = data.job;
-      if (!job) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        continue;
-      }
-
-      let status = 200;
-      let result;
-      try {
-        if (typeof job.id !== "string" || !/^[a-f0-9-]{36}$/.test(job.id) ||
-            !validIdentity(job.identity) || !["status", "exec", "echo"].includes(job.action)) {
-          status = 400;
-          result = { error: "invalid_oracle_job" };
-        } else if (job.action === "echo") {
-          const message = job.payload && typeof job.payload.message === "string" ? job.payload.message : "";
-          if (!message || message.length > 256) {
-            status = 400;
-            result = { error: "invalid_echo_message" };
-          } else {
-            result = { ok: true, vm_id: job.identity, received_by: "oracle", message };
-          }
-        } else if (job.action === "status") {
-          const session = await getSession(job.identity);
-          result = sessionSummary(session);
-        } else {
-          const payload = job.payload;
-          if (!payload || typeof payload.command !== "string" || !payload.command.trim() ||
-              payload.command.length > MAX_COMMAND_LENGTH) {
-            status = 400;
-            result = { error: "command_must_be_1_to_4096_characters" };
-          } else {
-            const requested = Number(payload.timeout_ms) || DEFAULT_TIMEOUT_MS;
-            const timeout = Math.max(1000, Math.min(requested, MAX_TIMEOUT_MS));
-            const execution = await executeCommand(job.identity, payload.command, timeout);
-            status = execution.status;
-            // Preserve the public Worker API response shape used by the previous executor.
-            result = { vm_id: job.identity, ...execution.body };
-          }
-        }
-      } catch (error) {
-        status = 500;
-        result = { error: "oracle_job_failed", detail: error instanceof Error ? error.message : String(error) };
-      }
-
-      const completed = await fetch(WORKER_URL + "/api/oracle/complete-job", {
+      const ticketResponse = await fetch(WORKER_URL + "/api/vm/agent-ticket", {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-executor-token": EXECUTOR_TOKEN,
-        },
-        body: JSON.stringify({ id: job.id, status, result }),
-        signal: AbortSignal.timeout(10000),
+        headers: { "x-admin-code": ORACLE_ADMIN_CODE },
+        signal: AbortSignal.timeout(10000)
       });
-      if (!completed.ok) throw new Error("complete_http_" + completed.status);
-    } catch (error) {
-      pollerFailures += 1;
-      if (pollerFailures === 1 || pollerFailures % 20 === 0) {
-        console.error("Oracle outbound bridge connection error:", error instanceof Error ? error.message : String(error));
+      if (!ticketResponse.ok) {
+        const detail = (await ticketResponse.text().catch(() => "")).slice(0, 200);
+        throw new Error("agent_ticket_http_" + ticketResponse.status + (detail ? ":" + detail : ""));
       }
-      await new Promise(resolve => setTimeout(resolve, Math.min(1000 + pollerFailures * 250, 5000)));
+      const ticketData = await ticketResponse.json();
+      if (typeof ticketData.ticket !== "string" || !ticketData.ticket) {
+        throw new Error("agent_ticket_response_missing_ticket");
+      }
+
+      const wsUrl = WORKER_URL.replace(/^https:/, "wss:") +
+        "/api/vm/agent?ticket=" + encodeURIComponent(ticketData.ticket);
+
+      await new Promise((resolve, reject) => {
+        const socket = new WebSocket(wsUrl);
+        agentSocket = socket;
+        let opened = false;
+        let heartbeat = null;
+        const connectTimer = setTimeout(() => {
+          if (!opened) {
+            try { socket.close(); } catch {}
+            reject(new Error("agent_websocket_connect_timeout"));
+          }
+        }, 15000);
+
+        socket.addEventListener("open", () => {
+          opened = true;
+          clearTimeout(connectTimer);
+          reconnectFailures = 0;
+          console.log("Oracle agent connected to Cloudflare VM coordinator (Admin).");
+          heartbeat = setInterval(() => {
+            if (socket.readyState === WebSocket.OPEN) {
+              try { socket.send(JSON.stringify({ type: "heartbeat" })); } catch {}
+            }
+          }, 15000);
+          heartbeat.unref?.();
+        });
+
+        socket.addEventListener("message", event => {
+          void handleAgentMessage(socket, event.data);
+        });
+
+        socket.addEventListener("error", () => {
+          if (!opened) {
+            clearTimeout(connectTimer);
+            reject(new Error("agent_websocket_connect_failed"));
+          }
+        });
+
+        socket.addEventListener("close", event => {
+          clearTimeout(connectTimer);
+          if (heartbeat) clearInterval(heartbeat);
+          if (agentSocket === socket) agentSocket = null;
+          console.warn("Oracle agent WebSocket closed (code " + event.code + ").");
+          if (!opened) reject(new Error("agent_websocket_closed_before_connect"));
+          else resolve();
+        });
+      });
+    } catch (error) {
+      reconnectFailures += 1;
+      if (reconnectFailures === 1 || reconnectFailures % 10 === 0) {
+        console.error("Oracle Cloudflare agent connection failed:", error instanceof Error ? error.message : String(error));
+      }
     }
+    await sleep(Math.min(1000 * (2 ** Math.min(reconnectFailures, 5)), 30000));
   }
 }
 
@@ -413,7 +476,7 @@ await fs.mkdir(SESSIONS_DIR, { recursive: true, mode: 0o700 });
 server.listen(PORT, HOST, () => {
   console.log("Oracle persistent host executor listening on http://" + HOST + ":" + PORT);
   console.log("Runtime: native " + process.arch + "; no guest VM or ISO required.");
-  void runOracleBridgePoller();
+  void runOracleAgent();
 });
 
 function shutdown() {
