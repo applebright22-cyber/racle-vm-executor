@@ -297,10 +297,24 @@ async function handleAgentMessage(socket, data) {
     return;
   }
 
+  // Cloudflare must bind every execution to the authenticated account that
+  // initiated it. Never fall back to the shared "oracle" identity.
+  const accountId = typeof request.account_id === "string" ? request.account_id : "";
+  if (!validIdentity(accountId)) {
+    console.warn("Ignoring execution request with invalid or missing account_id.");
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        type: "result", id: request.id, stdout: "",
+        stderr: "invalid_or_missing_account_id", exit_code: 125, timed_out: false
+      }));
+    }
+    return;
+  }
+
   const timeout = Math.max(1000, Math.min(Number(request.timeout_ms) || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS));
   let result;
   try {
-    const execution = await executeCommand("oracle", request.command, timeout);
+    const execution = await executeCommand(accountId, request.command, timeout);
     const body = execution.body || {};
     result = {
       type: "result",
