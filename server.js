@@ -346,7 +346,7 @@ async function runOracleAgent() {
     return;
   }
 
-  console.log("Oracle outbound WebSocket agent connecting to " + WORKER_URL + " as Admin.");
+  console.log("Oracle outbound WebSocket agent connecting to " + WORKER_URL + " as oracle.");
   while (true) {
     try {
       const ticketResponse = await fetch(WORKER_URL + "/api/vm/agent-ticket", {
@@ -385,7 +385,7 @@ async function runOracleAgent() {
           opened = true;
           clearTimeout(connectTimer);
           reconnectFailures = 0;
-          console.log("Oracle agent connected to Cloudflare VM coordinator (Admin).");
+          console.log("Oracle agent connected to Cloudflare VM coordinator (oracle).");
           heartbeat = setInterval(() => {
             if (socket.readyState === WebSocket.OPEN) {
               try { socket.send(JSON.stringify({ type: "heartbeat" })); } catch {}
