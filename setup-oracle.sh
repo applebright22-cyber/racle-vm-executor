@@ -40,7 +40,7 @@ bash -n setup-oracle.sh
 NODE_PATH="$(command -v node)"
 sudo tee "$ENV_FILE" >/dev/null <<EOF
 PORT=8787
-HOST=0.0.0.0
+HOST=127.0.0.1
 SESSIONS_DIR=$APP_DIR/sessions
 ORACLE_EXECUTOR_TOKEN=$EXECUTOR_TOKEN
 EOF
