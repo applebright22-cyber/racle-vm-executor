@@ -1,64 +1,65 @@
 # Oracle Persistent Host Executor
 
-Oracle is the persistent execution layer behind the existing Cloudflare VM API. It runs account-scoped Bash sessions on the Oracle Linux host and maintains an outbound WebSocket connection to Cloudflare. The existing Cloudflare Worker and public API are not rebuilt or modified by this repository.
+This service runs on the Oracle Linux host and keeps an outbound WebSocket connection to the existing Cloudflare Worker. It provides the persistent **Oracle host** command session used by the project's Admin execution path.
 
-**This is a persistent Oracle host shell, not a byte-for-byte mirror of browser VM RAM or a shell inside the Tiny Core guest.**
+**It is not TinyCore, does not mirror the browser VM's RAM, and does not forward the TinyCore guest's network packets.**
 
-> **Multi-user safety gate:** account-named session directories do not isolate arbitrary shell commands. Commands run with the Linux permissions of the service user (normally `opc`). Do not expose the host shell as a normal-user terminal or route untrusted account commands to the shared `oracle` agent until per-account OS/container isolation and end-to-end identity validation are implemented and tested. The installer binds the local HTTP API to `127.0.0.1`; the Cloudflare agent uses an outbound WebSocket.
- The existing Worker currently routes its VM execution API to the Admin identity; this bridge connects as `admin`.
+## Runtime boundary
 
-## How it works
+- The browser VM runs in v86 in the browser and stores snapshots in Cloudflare R2.
+- This service runs Bash commands on the Oracle Linux host as the service user (normally opc).
+- The Cloudflare agent connection uses an outbound WebSocket; no public Oracle API port is needed for that connection.
+- The Worker blocks account-level Oracle shell execution unless ORACLE_ACCOUNT_EXEC_ENABLED is exactly true.
+- **Do not enable account-level execution yet.** Per-account session directories are not OS isolation. Do not route untrusted users' commands to the shared host until per-account OS/container isolation and end-to-end identity validation are implemented and tested.
 
-- Oracle requests a short-lived agent ticket from `POST /api/vm/agent-ticket` using the existing five-digit Cloudflare Admin access code.
-- Oracle opens `/api/vm/agent?ticket=...` over WebSocket. The ticket is single-use and expires after 60 seconds.
-- Cloudflare sends execution requests over the existing WebSocket protocol; Oracle runs each command in its persistent Admin Bash session and returns stdout, stderr, exit code, and timeout state.
-- Oracle sends heartbeats and reconnects automatically if the connection drops.
-- The connection is outbound from Oracle. No public Oracle IP endpoint, inbound firewall rule, Cloudflare API token, or per-user API key is required for the Admin agent connection.
+## Install or update
 
-The Admin access code is stored in `/etc/oracle-vm-executor.env`, which the setup script restricts to root read/write. It is used only to request agent tickets. The separate `ORACLE_EXECUTOR_TOKEN` protects the Oracle host's local `/status` and `/exec` endpoints.
+Run as the Oracle opc user with sudo access:
 
-Each supported identity has a separate long-lived Bash process and working directory under `sessions/<identity>/work`. Session metadata, working directory, command count, and last exit code are saved on disk. Live shell processes and exported shell variables do not survive a service restart.
-
-## Install or update on Oracle Linux
-
-Run as the Oracle `opc` user with sudo access:
-
-```sh
+~~~sh
 cd ~/racle-vm-executor
 git pull --ff-only
 bash setup-oracle.sh
-```
+~~~
 
-The setup script installs Node.js 22 or newer if needed, installs the project dependencies, configures the systemd service, and asks for:
+The setup script installs Node.js if needed, installs dependencies, configures the systemd service, and prompts for the Cloudflare Worker origin and the existing five-digit Admin access code. It preserves the local executor token when updating configuration.
 
-1. The Cloudflare Worker HTTPS origin (defaults to the current project Worker).
-2. The existing five-digit Cloudflare Admin access code.
-
-It preserves the existing local executor token when re-running setup, writes the Worker URL and Admin code into the protected environment file, restarts the service, and waits for `cloudflare_agent_connected: true` from the local health endpoint. It does not call missing `/api/oracle/*` routes or require changes to Cloudflare.
+The Admin access code is stored in /etc/oracle-vm-executor.env with restricted permissions and is used to request a short-lived agent ticket. The separate ORACLE_EXECUTOR_TOKEN protects the local /status and /exec endpoints. Keep it private.
 
 ## Health and logs
 
-```sh
+~~~sh
 curl -fsS http://127.0.0.1:8787/health
 sudo systemctl status oracle-vm-executor --no-pager
 sudo journalctl -u oracle-vm-executor -n 60 --no-pager
-```
+~~~
 
-A healthy service reports `runtime: "oracle-host"` and `cloudflare_agent_connected: true` when its WebSocket is connected. The health response also reports `guest_network_relay: false`: this repository executes persistent Oracle host commands but does not forward TinyCore guest packets. Guest Internet traffic uses the separate Cloudflare WISP relay at `/api/network/wisp/`. A healthy local process alone does not prove the Worker connection is online or that guest networking works.
+A healthy service reports runtime: "oracle-host" and cloudflare_agent_connected: true when the WebSocket is connected. guest_network_relay: false is expected: guest networking is handled separately by the Cloudflare WISP relay. A healthy local process does not prove guest DNS works or that account-level Oracle execution is enabled.
 
 ## Local API
 
 All responses are JSON.
 
-- `GET /health` — local service and Cloudflare-agent connection status.
-- `GET /status?identity=admin` — requires the local `x-executor-token`; returns persistent shell status.
-- `POST /exec` — requires `x-executor-token`, `x-account-id: acct-<uuid>`, and a JSON body such as:
+- GET /health — service and Cloudflare-agent connection status.
+- GET /status?identity=admin — requires the local x-executor-token.
+- POST /exec — requires x-executor-token, an x-account-id identity, and a JSON body.
 
-```json
+Example request body:
+
+~~~json
 {
   "command": "pwd; uname -a",
   "timeout_ms": 15000
 }
-```
+~~~
 
-Commands execute as the Linux user running the service (normally `opc`), not as root. The endpoint can run arbitrary shell commands, so keep the local executor token private. A command timeout leaves the command running and keeps that session busy until it finishes.
+Commands execute with the Linux permissions of the service user, not as root. The endpoint can run arbitrary shell commands, so keep the local token private. Commands are limited to 4,096 characters and a maximum timeout of 20 seconds. A timeout may leave the command running; check the session before submitting another command.
+
+## Checks
+
+~~~sh
+npm test
+npm run check
+~~~
+
+These run the local Node.js tests and syntax check. They do not deploy the Cloudflare Worker or run GitHub Actions.
