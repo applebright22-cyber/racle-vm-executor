@@ -297,10 +297,26 @@ async function handleAgentMessage(socket, data) {
     return;
   }
 
+  const accountId = request.account_id;
+  if (!validIdentity(accountId)) {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        type: "result",
+        id: request.id,
+        stdout: "",
+        stderr: "invalid_or_missing_account_id",
+        exit_code: 125,
+        timed_out: false
+      }));
+    }
+    console.warn("Rejected Cloudflare execution request without a valid account identity.");
+    return;
+  }
+
   const timeout = Math.max(1000, Math.min(Number(request.timeout_ms) || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS));
   let result;
   try {
-    const execution = await executeCommand("oracle", request.command, timeout);
+    const execution = await executeCommand(accountId, request.command, timeout);
     const body = execution.body || {};
     result = {
       type: "result",
