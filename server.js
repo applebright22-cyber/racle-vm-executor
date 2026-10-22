@@ -434,7 +434,10 @@ const server = http.createServer(async (req, res) => {
       architecture: process.arch,
       execution_available: true,
       persistent_sessions: true,
-      cloudflare_agent_connected: typeof WebSocket === "function" && agentSocket?.readyState === WebSocket.OPEN
+      cloudflare_agent_connected: typeof WebSocket === "function" && agentSocket?.readyState === WebSocket.OPEN,
+      guest_network_relay: false,
+      network_relay_runtime: "cloudflare-wisp-relay",
+      note: "This service executes Oracle host commands; guest packet forwarding is handled by the Cloudflare WISP relay."
     });
   }
 
