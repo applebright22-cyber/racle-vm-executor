@@ -10,7 +10,7 @@ This service runs on the Oracle Linux host and keeps an outbound WebSocket conne
 - This service runs Bash commands on the Oracle Linux host as the service user (normally opc).
 - The Cloudflare agent connection uses an outbound WebSocket; no public Oracle API port is needed for that connection.
 - The Worker blocks account-level Oracle shell execution unless ORACLE_ACCOUNT_EXEC_ENABLED is exactly true.
-- Regular-account shells run under a dedicated unprivileged Linux account (`ovm-<account-uuid>`) with a private home/workspace, separate from `opc` and every other account. The root-owned launcher validates the account ID, provisions the account, and applies process, memory, file-size, open-file, CPU-time, and core-dump limits before starting Bash. Admin remains on the existing `opc` shell.
+- Regular-account shells run under a dedicated unprivileged Linux account (a unique 32-character username derived from the account UUID) with a private home/workspace, separate from `opc` and every other account. The root-owned launcher validates the account ID, provisions the account, and applies process, memory, file-size, open-file, CPU-time, and core-dump limits before starting Bash. Admin remains on the existing `opc` shell.
 - This is Linux user/process isolation, not a container or separate kernel. It reduces cross-account file/process access but still shares the host kernel and network. Keep `ORACLE_ACCOUNT_EXEC_ENABLED` disabled until the launcher is installed and the two-account isolation test plus end-to-end account identity tests pass.
 
 ## Install or update
