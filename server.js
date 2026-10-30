@@ -135,7 +135,10 @@ function startShell(session) {
   const child = spawn("/bin/bash", ["--noprofile", "--norc"], {
     cwd: session.state.cwd,
     env,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    // Give each persistent shell its own process group so a timed-out command
+    // and any foreground child processes can be stopped together.
+    detached: true
   });
   session.process = child;
 
@@ -249,11 +252,27 @@ async function executeCommand(identity, command, timeoutMs) {
     };
     session.pending = pending;
     pending.timeout = setTimeout(() => {
-      // The command is deliberately left running. Its shell remains busy until it
-      // finishes, so a later request cannot accidentally interleave with it.
-      resolve({
+      // A timed-out command must not leave the persistent session permanently busy.
+      // Kill the whole shell process group, then allow the next request to start a
+      // clean shell for this same account. This prevents command interleaving.
+      const child = session.process;
+      if (child) {
+        session.process = null;
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          try { child.kill("SIGKILL"); } catch {}
+        }
+      }
+      finishPending(session, {
         status: 504,
-        body: { error: "execution_timeout", execution_id: id, timed_out: true, command_still_running: true }
+        body: {
+          error: "execution_timeout",
+          execution_id: id,
+          timed_out: true,
+          command_still_running: false,
+          shell_restarted: true
+        }
       });
     }, timeoutMs);
 
