@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IDENTITY="${1:-}"
+REQUESTED_CWD="${2:-}"
+if [[ ! "$IDENTITY" =~ ^acct-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; then
+  echo "invalid_account_identity" >&2
+  exit 64
+fi
+
+ACCOUNT_ROOT="/var/lib/oracle-vm-executor/accounts"
+ACCOUNT_HOME="$ACCOUNT_ROOT/$IDENTITY"
+WORK_DIR="$ACCOUNT_HOME/work"
+USERNAME="ovm-${IDENTITY#acct-}"
+USERNAME="${USERNAME//-/}"
+
+case "$REQUESTED_CWD" in
+  "$ACCOUNT_HOME"|"$ACCOUNT_HOME"/*) START_DIR="$REQUESTED_CWD" ;;
+  *) START_DIR="$WORK_DIR" ;;
+esac
+if [[ ! -d "$START_DIR" ]]; then START_DIR="$WORK_DIR"; fi
+
+install -d -o root -g root -m 0711 /var/lib/oracle-vm-executor
+install -d -o root -g root -m 0711 "$ACCOUNT_ROOT"
+
+if ! getent passwd "$USERNAME" >/dev/null 2>&1; then
+  useradd --system --user-group --create-home --home-dir "$ACCOUNT_HOME" --shell /sbin/nologin "$USERNAME"
+fi
+
+PASSWD_ENTRY="$(getent passwd "$USERNAME")"
+ACTUAL_HOME="$(printf '%s\n' "$PASSWD_ENTRY" | cut -d: -f6)"
+if [[ "$ACTUAL_HOME" != "$ACCOUNT_HOME" ]]; then
+  echo "account_home_mismatch" >&2
+  exit 65
+fi
+
+install -d -o "$USERNAME" -g "$USERNAME" -m 0700 "$ACCOUNT_HOME" "$WORK_DIR"
+chown "$USERNAME:$USERNAME" "$START_DIR"
+chmod 0700 "$START_DIR"
+
+cd "$START_DIR"
+ulimit -c 0
+ulimit -n 256
+ulimit -u 64
+ulimit -v 1048576
+ulimit -f 1048576
+ulimit -t 3600
+umask 077
+
+exec runuser -u "$USERNAME" -- env \
+  HOME="$ACCOUNT_HOME" USER="$USERNAME" LOGNAME="$USERNAME" \
+  ORACLE_ACCOUNT_ID="$IDENTITY" ORACLE_SESSION_DIR="$ACCOUNT_HOME" \
+  PWD="$START_DIR" /bin/bash --noprofile --norc
