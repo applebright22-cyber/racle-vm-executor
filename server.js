@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { parseShellOutput } from "./shell-output.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -206,27 +207,23 @@ function finishPending(session, result) {
 function settleIfComplete(session) {
   const pending = session.pending;
   if (!pending) return;
-  const endPattern = new RegExp(pending.endMarker + ":(-?\\d+)\\r?\\n");
-  const endMatch = endPattern.exec(pending.stdout);
-  if (!endMatch) return;
-
-  const startAt = pending.stdout.indexOf(pending.startMarker);
-  const endAt = endMatch.index;
-  let stdout = startAt >= 0
-    ? pending.stdout.slice(startAt + pending.startMarker.length, endAt)
-    : pending.stdout;
-  stdout = stdout.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
-  const cwdPattern = new RegExp(pending.cwdMarker + "([^\\r\\n]*)");
-  const cwdMatch = cwdPattern.exec(pending.stdout.slice(endAt + endMatch[0].length));
-  // stdout chunks can split between the exit marker and cwd marker; wait for both.
-  if (!cwdMatch) return;
-  const cwd = cwdMatch[1].trim();
+  const parsed = parseShellOutput(
+    pending.stdout,
+    pending.startMarker,
+    pending.endMarker,
+    pending.cwdMarker
+  );
+  if (!parsed) return;
 
   const accountHome = session.identity === "admin" ? null : path.join(ACCOUNT_HOME_DIR, session.identity);
-  const accountCwdAllowed = !accountHome || cwd === accountHome || cwd.startsWith(accountHome + path.sep);
-  session.state.cwd = cwd.startsWith("/") && accountCwdAllowed ? cwd : session.workDir;
+  const accountCwdAllowed = !accountHome ||
+    parsed.cwd === accountHome ||
+    parsed.cwd.startsWith(accountHome + path.sep);
+  session.state.cwd = parsed.cwd.startsWith("/") && accountCwdAllowed
+    ? parsed.cwd
+    : session.workDir;
   session.state.commandCount += 1;
-  session.state.lastExitCode = Number(endMatch[1]);
+  session.state.lastExitCode = parsed.exitCode;
   void saveSessionState(session).catch(error => {
     console.error("Session state save failed for " + session.identity + ":", error.message);
   });
@@ -238,10 +235,10 @@ function settleIfComplete(session) {
       browser_required: false,
       persistent_session: true,
       execution_id: pending.id,
-      stdout: stdout.slice(0, MAX_CAPTURE_BYTES),
+      stdout: parsed.stdout.slice(0, MAX_CAPTURE_BYTES),
       stderr: pending.stderr.slice(0, MAX_CAPTURE_BYTES),
-      exit_code: Number(endMatch[1]),
-      output_truncated: pending.truncated || stdout.length > MAX_CAPTURE_BYTES,
+      exit_code: parsed.exitCode,
+      output_truncated: pending.truncated || parsed.stdout.length > MAX_CAPTURE_BYTES,
       cwd: session.state.cwd
     }
   });
