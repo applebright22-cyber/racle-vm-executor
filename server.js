@@ -53,7 +53,7 @@ function readJson(req) {
 }
 
 function validIdentity(identity) {
-  return identity === "admin" || /^acct-[a-f0-9-]{36}$/.test(identity);
+  return identity === "admin" || /^acct-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(identity);
 }
 
 function sessionSummary(session) {
@@ -507,7 +507,7 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === "/exec" && req.method === "POST") {
     if (!authorized(req)) return sendJson(res, 401, { error: "unauthorized" });
     const identity = String(req.headers["x-account-id"] || "");
-    if (!/^acct-[a-f0-9-]{36}$/.test(identity)) {
+    if (!/^acct-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(identity)) {
       return sendJson(res, 400, { error: "invalid_account_id" });
     }
     let body;
