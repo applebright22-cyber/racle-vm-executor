@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+i="${1:-}"; c="${2:-}"
+[[ "$i" =~ ^acct-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || exit 64
+b=/var/lib/oracle-vm-executor/accounts; h="$b/$i"; w="$h/work"
+u="${i#acct-}"; u="${u//-/}"
+install -d -o root -g root -m 0711 /var/lib/oracle-vm-executor "$b"
+if ! getent passwd "$u" >/dev/null; then
+ useradd --user-group --create-home --home-dir "$h" --shell /sbin/nologin "$u"
+ chown "$u:$u" "$h"; chmod 700 "$h"
+fi
+[[ "$(getent passwd "$u" | cut -d: -f6)" == "$h" && -d "$h" && ! -L "$h" ]] || exit 65
+[[ "$(stat -c %U "$h")" == "$u" && ! -L "$w" ]] || exit 66
+if [[ ! -d "$w" ]]; then mkdir -m 700 "$w"; chown "$u:$u" "$w"; fi
+[[ "$(stat -c %U "$w")" == "$u" ]] || exit 67
+s="$w"
+if [[ -d "$c" ]]; then
+ hr="$(realpath -e "$h")"; cr="$(realpath -e "$c")"
+ case "$cr" in "$hr"|"$hr"/*) [[ "$(stat -c %U "$cr")" == "$u" ]] && s="$cr";; esac
+fi
+cd "$s"
+ulimit -c 0; ulimit -n 256; ulimit -u 64; ulimit -v 1048576; ulimit -f 1048576; ulimit -t 3600
+umask 077
+exec "$(command -v runuser)" -u "$u" -- env HOME="$h" USER="$u" LOGNAME="$u" ORACLE_ACCOUNT_ID="$i" ORACLE_SESSION_DIR="$h" PWD="$s" /bin/bash --noprofile --norc
