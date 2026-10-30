@@ -37,6 +37,7 @@ chmod 700 sessions
 node --check server.js
 bash -n setup-oracle.sh
 bash -n setup-account-isolation.sh
+bash -n test-account-isolation.sh
 bash setup-account-isolation.sh
 
 NODE_PATH="$(command -v node)"
