@@ -106,11 +106,15 @@ async function getSession(identity) {
   }
   state.identity = identity;
   if (typeof state.cwd !== "string") state.cwd = workDir;
-  try {
-    const stat = await fs.stat(state.cwd);
-    if (!stat.isDirectory()) state.cwd = workDir;
-  } catch {
-    state.cwd = workDir;
+  if (accountIdentity) {
+    if (!(state.cwd === accountHome || state.cwd.startsWith(accountHome + path.sep))) state.cwd = workDir;
+  } else {
+    try {
+      const stat = await fs.stat(state.cwd);
+      if (!stat.isDirectory()) state.cwd = workDir;
+    } catch {
+      state.cwd = workDir;
+    }
   }
 
   session = {
