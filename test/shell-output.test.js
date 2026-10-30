@@ -7,7 +7,7 @@ test("parses a completed command and preserves stdout, exit code, and cwd", () =
     "__START__",
     "pong from google",
     "__END__:0",
-    "__CWD__:/var/lib/oracle-vm-executor/accounts/acct-123/work",
+    "__CWD__/var/lib/oracle-vm-executor/accounts/acct-123/work",
     ""
   ].join("\n");
   assert.deepEqual(
