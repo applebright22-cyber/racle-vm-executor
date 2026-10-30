@@ -8,6 +8,8 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
 const EXECUTOR_TOKEN = process.env.ORACLE_EXECUTOR_TOKEN || "";
 const SESSIONS_DIR = path.resolve(process.env.SESSIONS_DIR || "./sessions");
+const ACCOUNT_HOME_DIR = path.resolve(process.env.ACCOUNT_HOME_DIR || "/var/lib/oracle-vm-executor/accounts");
+const ACCOUNT_SHELL_HELPER = process.env.ACCOUNT_SHELL_HELPER || "/usr/local/libexec/oracle-vm-account-shell";
 const MAX_COMMAND_LENGTH = 4096;
 const MAX_REQUEST_BYTES = 16 * 1024;
 const MAX_CAPTURE_BYTES = 1024 * 1024;
@@ -82,9 +84,12 @@ async function getSession(identity) {
   if (session) return session;
 
   const directory = path.join(SESSIONS_DIR, identity);
-  const workDir = path.join(directory, "work");
+  const accountIdentity = identity !== "admin";
+  const accountHome = accountIdentity ? path.join(ACCOUNT_HOME_DIR, identity) : null;
+  const workDir = accountIdentity ? path.join(accountHome, "work") : path.join(directory, "work");
   const statePath = path.join(directory, "session.json");
-  await fs.mkdir(workDir, { recursive: true, mode: 0o700 });
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  if (!accountIdentity) await fs.mkdir(workDir, { recursive: true, mode: 0o700 });
   let state;
   try {
     state = JSON.parse(await fs.readFile(statePath, "utf8"));
@@ -125,15 +130,20 @@ async function getSession(identity) {
 function startShell(session) {
   if (session.process && session.process.exitCode === null && !session.process.killed) return;
 
+  const accountIdentity = session.identity !== "admin";
   const env = { ...process.env };
   delete env.ORACLE_EXECUTOR_TOKEN;
-  env.HOME = session.workDir;
+  env.HOME = accountIdentity ? path.join(ACCOUNT_HOME_DIR, session.identity) : session.workDir;
   env.ORACLE_ACCOUNT_ID = session.identity;
-  env.ORACLE_SESSION_DIR = session.directory;
+  env.ORACLE_SESSION_DIR = accountIdentity ? env.HOME : session.directory;
   env.PWD = session.state.cwd;
 
-  const child = spawn("/bin/bash", ["--noprofile", "--norc"], {
-    cwd: session.state.cwd,
+  const command = accountIdentity ? "/usr/bin/sudo" : "/bin/bash";
+  const args = accountIdentity
+    ? ["-n", ACCOUNT_SHELL_HELPER, session.identity, session.state.cwd]
+    : ["--noprofile", "--norc"];
+  const child = spawn(command, args, {
+    cwd: accountIdentity ? SESSIONS_DIR : session.state.cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
     // Give each persistent shell its own process group so a timed-out command
@@ -208,7 +218,9 @@ function settleIfComplete(session) {
   if (!cwdMatch) return;
   const cwd = cwdMatch[1].trim();
 
-  session.state.cwd = cwd.startsWith("/") ? cwd : session.workDir;
+  const accountHome = session.identity === "admin" ? null : path.join(ACCOUNT_HOME_DIR, session.identity);
+  const accountCwdAllowed = !accountHome || cwd === accountHome || cwd.startsWith(accountHome + path.sep);
+  session.state.cwd = cwd.startsWith("/") && accountCwdAllowed ? cwd : session.workDir;
   session.state.commandCount += 1;
   session.state.lastExitCode = Number(endMatch[1]);
   void saveSessionState(session).catch(error => {
