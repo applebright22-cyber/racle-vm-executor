@@ -3,8 +3,8 @@ set -euo pipefail
 HELPER="/usr/local/libexec/oracle-vm-account-shell"
 A="acct-$(cat /proc/sys/kernel/random/uuid)"
 B="acct-$(cat /proc/sys/kernel/random/uuid)"
-UA="ovm-${A#acct-}"; UA="${UA//-/}"
-UB="ovm-${B#acct-}"; UB="${UB//-/}"
+UA="${A#acct-}"; UA="${UA//-/}"
+UB="${B#acct-}"; UB="${UB//-/}"
 HA="/var/lib/oracle-vm-executor/accounts/$A"
 HB="/var/lib/oracle-vm-executor/accounts/$B"
 cleanup() {
